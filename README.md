@@ -1,111 +1,278 @@
-# ios-flame
+# ios-guacamole
 
-**Apple's iOS 16 running on a Google Pixel 4.**
+**Experimental port of Apple's iOS 16 to the OnePlus 7 Pro (GM1917).**
 
-A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) to the Pixel 4 (`flame`, Qualcomm SM8150 /
-Snapdragon 855, Adreno 640). Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation), with ios-sweet's
-patches and the flame ones on top, runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**. The
-phone is booted with `fastboot boot` from Google's own bootloader. Nothing is flashed to the boot chain; the iOS
-root lives in the `userdata` partition.
+A work-in-progress port of [ios-flame](https://github.com/NWylynko/ios-flame), itself based on [ios-sweet](https://github.com/dipa-studio/ios-sweet), targeting the OnePlus 7 Pro (`guacamole`, Qualcomm SM8150 / Snapdragon 855, Adreno 640).
 
-![Lock screen, home screen, Settings, General, Control Center, Today view, Spotlight, Clock, Calendar, Notes, Photos and Safari, all rendered through Metal on the Adreno 640](docs/img/metal2-tour.jpg)
+The goal is to boot Apple's XNU kernel (xnu-8796, iOS 16 generation) and run the **unmodified iOS 16.7.16 (20H392) iPhone X userland** directly on the OnePlus 7 Pro.
 
-> Experimental bring-up, not a usable phone OS. It **erases Android's user data**, Apple's security model is
-> mostly switched off (permissive AMFI and sandbox, stub keystore), and many parts are missing. Do not put
-> anything personal on it.
+The OnePlus 7 Pro shares the Snapdragon 855 and Adreno 640 GPU with the Google Pixel 4, making `ios-flame` a promising starting point for the port.
 
-## What works (2026-10-22, kernel 0124)
+> **Development status: Early bring-up — October 24, 2026**
+>
+> The repository is currently based on the Pixel 4 implementation. OnePlus-specific hardware support and bootloader integration are planned.
+>
+> **iOS has not yet been booted on the OnePlus 7 Pro using this fork.**
+>
+> This is experimental software. Do not flash Pixel 4 boot images or run the original installation scripts on the OnePlus 7 Pro. They may erase userdata or damage the device's software installation.
 
-| Area | State |
+## Target hardware
+
+| Component | OnePlus 7 Pro |
 | --- | --- |
-| Boot | Google ABL (unlocked) -> `fastboot boot` of the shim -> XNU. Every reset lands back in fastboot (the shim sets the PMIC reboot reason) |
-| CPU | All 8 cores (4x Cortex-A55 + 4x Cortex-A76) at full clock, PSCI |
-| Storage | UFS 3.0; the iOS root is an HFS+ image in `userdata`, read/write |
-| Display | The 1080x2280 command-mode panel ABL leaves running. iOS sees an iPhone X (1125x2436); the Adreno 640 scales each frame to fit, with Apple's continuous corners |
-| GPU / Metal | Metal on Mesa's Turnip Vulkan driver through metal2vulkan (`sweetmtl=2`): backboardd, SpringBoard and apps render on the GPU, shaders compile on the phone. Swiping home screens runs at about 20-26 fps |
-| Touch, buttons | ST FTS touch over SPI; power and volume keys |
-| USB | Ethernet to the Mac: SSH (dropbear), a kernel file server, the live kernel log, internet sharing |
-| Wi-Fi | The WCN3990 radio driven from userland (`wland`): scan, WPA2-PSK, joins at boot. **Settings -> Wi-Fi works** (wifid on en0, iOS's own DHCP) |
-| Apps | Settings, Safari (renders full pages), Clock, Calendar, Notes, Photos and the other stock apps. An ad hoc-signed third-party IPA (YouTube) launches and browses |
-| Time | PM8150 RTC |
+| Device | OnePlus 7 Pro |
+| Model | GM1917 |
+| Codename | `guacamole` |
+| SoC | Qualcomm Snapdragon 855 (SM8150) |
+| CPU | 8-core Kryo 485 (4 performance + 4 efficiency cores) |
+| GPU | Qualcomm Adreno 640 |
+| Storage | 256 GB UFS 3.0 |
+| Display | 6.67-inch Fluid AMOLED, 1440 × 3120 |
+| Bootloader | Qualcomm/OnePlus ABL |
+| Bootloader status | Unlocked on development device |
+| Target OS | iOS 16.7.16 (20H392) |
+| Target kernel | XNU 8796 |
 
-**Not working yet:** audio, video playback (mediaserverd crashes), Bluetooth, cellular, camera, sensors, GPS,
-SEP / Face ID, HEIC/HEVC decoding (no software decoder), Today-view widgets with Metal (they use the CPU path),
-real battery readings.
+## Current status
 
-## How it boots
+The project is in the initial preparation and hardware adaptation stage.
 
+The original `ios-flame` project has demonstrated iOS 16 running on the Google Pixel 4, including GPU-accelerated rendering, Wi-Fi, storage, touchscreen input, and iOS applications.
+
+These features provide a foundation for the OnePlus port, but **they have not yet been validated on OnePlus hardware**.
+
+### Porting progress
+
+| Component | Status | Notes |
+| --- | --- | --- |
+| Repository | Forked | Based on `ios-flame` |
+| Target hardware | Identified | OnePlus 7 Pro GM1917, Snapdragon 855 |
+| Development environment | Planned | WSL2/Linux and Intel macOS Hackintosh |
+| Bootloader | Not ported | OnePlus ABL integration required |
+| Boot shim | Not ported | Pixel 4 implementation available |
+| XNU kernel | Existing upstream implementation | SM8150 support requires validation |
+| CPU / SMP | Not tested | Reuse upstream Snapdragon 855 implementation where possible |
+| UFS storage | Not tested | Board-specific partition layout must be verified |
+| Display | Not implemented | OnePlus AMOLED panel support required |
+| GPU / Metal | Not tested | Upstream Adreno 640 implementation available |
+| Touchscreen | Not implemented | OnePlus-specific controller support required |
+| USB | Not tested | Debugging and networking require adaptation |
+| Wi-Fi | Not tested | Firmware and board-specific configuration required |
+| iOS userland | Not booted | Target is the iPhone X iOS 16.7.16 userland |
+| SpringBoard | Not booted | Dependent on kernel, storage and display bring-up |
+| Audio / cellular / camera | Not implemented | Outside initial bring-up scope |
+
+**No working iOS boot on the OnePlus 7 Pro is claimed at this stage.**
+
+## Development strategy
+
+The initial goal is to reuse as much of `ios-flame` as possible while introducing OnePlus-specific hardware support.
+
+### Phase 1 — Bootloader and shim
+
+- Inspect the existing Pixel 4 boot shim.
+- Research the OnePlus 7 Pro ABL boot requirements.
+- Extract the OnePlus stock boot image and device tree.
+- Identify physical memory regions and reserved memory.
+- Adapt the shim and boot arguments for `guacamole`.
+- Produce a test boot image compatible with OnePlus ABL.
+- Attempt temporary booting using `fastboot boot`.
+
+**Milestone:** Execute the custom boot shim on the OnePlus 7 Pro and obtain diagnostic output.
+
+### Phase 2 — XNU kernel bring-up
+
+- Attempt to reuse the existing Pixel 4 XNU kernel build.
+- Adapt the Apple Device Tree for the OnePlus 7 Pro.
+- Verify CPU initialization, timers and interrupts.
+- Adapt board-specific memory mappings.
+- Implement or modify drivers where required.
+- Rebuild XNU if the existing kernel binary cannot initialize correctly.
+
+**Milestone:** Reach XNU kernel initialization without a fatal exception.
+
+### Phase 3 — Storage and iOS userland
+
+- Adapt the existing Qualcomm UFS implementation.
+- Verify the OnePlus storage and partition layout.
+- Prepare an iOS HFS+ root filesystem.
+- Establish a safe installation and recovery procedure.
+- Mount the iOS root filesystem.
+- Start `launchd` and essential iOS services.
+
+**Milestone:** Boot into the iOS 16 userland.
+
+### Phase 4 — Display and input
+
+- Initialize the OnePlus 7 Pro AMOLED display.
+- Adapt the framebuffer and display pipeline.
+- Integrate the existing Adreno 640 GPU implementation.
+- Adapt Metal rendering through Turnip and metal2vulkan.
+- Implement touchscreen and hardware button support.
+
+**Milestone:** Display and interact with SpringBoard.
+
+### Phase 5 — Additional hardware
+
+After achieving a functional graphical environment, investigate:
+
+- Wi-Fi
+- USB networking and SSH
+- Battery and charging information
+- Audio
+- Bluetooth
+- Sensors
+- Video decoding
+- Cameras
+- Cellular connectivity
+
+These features are not guaranteed to work.
+
+## Proposed boot process
+
+```text
+OnePlus 7 Pro
+    |
+    v
+OnePlus ABL (unlocked bootloader)
+    |
+    v
+fastboot boot guacamole-test.img
+    |
+    v
+Custom guacamole boot shim
+    |
+    +-- Initialize boot arguments
+    +-- Configure memory layout
+    +-- Construct Apple Device Tree
+    +-- Load modified XNU kernel
+    |
+    v
+XNU 8796 (iOS 16)
+    |
+    +-- Qualcomm SM8150 hardware support
+    +-- UFS storage
+    +-- Display and GPU
+    +-- Touchscreen and input
+    |
+    v
+iOS 16.7.16 userland
+    |
+    v
+SpringBoard
 ```
-ABL (Google's bootloader, unlocked)
-  -> fastboot boot shim-boot.img          LZ4 kernel + AVB hash footer, or ABL refuses it
-       shim (shim/): acts as iBoot. Logs to UFS, sets the PON reason, arms the watchdog,
-       builds the boot args and jumps to XNU with an Apple device tree (tools/mkadt.py)
-  -> XNU (xnu/patches): every driver built in: UFS, display, GPU, touch, keys, USB, RTC,
-       RPMh, /dev/pmem for the userland drivers, en0 for wifid
-  -> launchd and the iPhone X userland from userdata
-       + phone/: SweetMetal2.bundle (Metal), wland (Wi-Fi), debug tools
-```
 
-## Repository
+This represents the intended architecture, **not a currently working boot sequence**.
 
-| Path | What |
+## Development environment
+
+Two environments are planned for development.
+
+### Linux / WSL2
+
+Used for:
+
+- Boot shim development
+- ARM64 cross-compilation
+- Device-tree generation
+- Android boot image packaging
+- Qualcomm firmware analysis
+- Fastboot tooling
+
+### Intel macOS Hackintosh
+
+Used for:
+
+- XNU kernel compilation
+- Apple SDK-dependent builds
+- iOS userland utilities
+- Toolchain testing
+
+The original `ios-flame` project includes build scripts and workflows that may require specific versions of Xcode, LLVM and other dependencies.
+
+## Repository structure
+
+The project currently inherits its structure from `ios-flame`.
+
+| Path | Purpose |
 | --- | --- |
-| `xnu/patches/` | 0001-0081 from ios-sweet, 0082-0124 for flame ([list](NOTES.md#flame-patches), [how to build](xnu/README.md)) |
-| `shim/` | The bare-metal shim ABL boots (`shim/build.sh`) |
-| `tools/` | Host tools: ADT and payload, boot-and-collect-logs loop, SSH/file/command access to the running phone, GPU and Metal debugging, ios-sweet's root-image scripts |
-| `phone/` | Code that runs in iOS: `wifi/` (wland), `metal2/` + `turnip/` (Metal on Turnip), `metal/` (the older template driver), `gpu/`, `tools/` (psx, pstack, openapp, lsreg, netsvc, oslog, ...) |
-| [NOTES.md](NOTES.md) | Hardware facts, Google ABL boot image rules, test loop, one line per flame patch |
-| [HANDOFF.md](HANDOFF.md) | The engineering log, newest first: every step, what broke and why |
-| [METAL-NEXT.md](METAL-NEXT.md) | The plan for Metal at user quality (metal2vulkan + Turnip) and why |
-| [RECOVERY.md](RECOVERY.md), [DEVICE.md](DEVICE.md) | Back to stock Android; the test phone and host setup |
-| `docs/ios-sweet/` | ios-sweet's README and notes (the history of patches 0001-0081) |
+| `xnu/patches/` | XNU patches inherited from ios-sweet and ios-flame |
+| `shim/` | Bare-metal boot shim |
+| `tools/` | Boot image tools, device-tree generation and debugging |
+| `phone/` | iOS-side drivers, services and utilities |
+| `NOTES.md` | Original Pixel 4 engineering notes |
+| `HANDOFF.md` | Original Pixel 4 development history |
+| `RECOVERY.md` | Original Pixel 4 recovery instructions |
+| `DEVICE.md` | Original Pixel 4 hardware information |
 
-## Not in git: what you need to get yourself
+Existing Pixel 4 documentation and scripts should not be treated as OnePlus 7 Pro installation instructions.
 
-Scripts expect these at the paths shown (all gitignored). None of them can be shared: they are Apple's or
-Google's/Qualcomm's files, or data from your own phone.
+OnePlus-specific build targets, scripts and documentation will be added as development progresses.
 
-- **The phone**: a Pixel 4 (`flame`; the 4 XL `coral` is untested) with the bootloader unlocked, on the final
-  Android 13 build `TP1A.221005.002.B2`. Keep Google's factory image in `images/` ([RECOVERY.md](RECOVERY.md)).
-  Back up the per-device partitions first (persist, modemst1/2, fsg, fsc, ...) into `backup/`. They hold your
-  IMEI and calibration data, so keep them private.
-- **Boot image tools**: AOSP `mkbootimg` in `downloads/mkbootimg/`, `avbtool.py` in `downloads/avb/`, and the
-  stock DTB (`python3 tools/unpack_bootv2.py boot.img stock/` on the factory image's boot.img) as `stock/dtb`.
-- **TWRP** 3.7.1_12-0 for flame in `downloads/twrp/`. It writes the root image and reads the logs back. The
-  test loop keeps it in `boot_a` (see NOTES.md).
-- **The iOS root**: the iPhone X iOS 16.7.16 (20H392) IPSW. `tools/remotezip.py` fetches single files from
-  Apple's CDN. Build the HFS+ image with `tools/mkiosroot.sh` in a Linux VM (apfs-fuse, hfsprogs), then run
-  `tools/sweet-root-tweaks.py`. Write it from TWRP with `adb exec-in 'dd of=/dev/block/sda15 bs=4194304' < IMG`,
-  not `fastboot flash userdata` (ABL hangs on the last chunk).
-- **Firmware** from the factory image's `vendor.img` (`/firmware`):
-  - GPU: `a640_gmu.bin`, `a640_zap.mdt`/`.b02` and `a630_sqe.fw` in `research/gpu/fw/` (`flame-run.sh -G`
-    puts them in the device tree).
-  - Wi-Fi: `wlanmdsp.mbn`, `modemuw.jsn` and `bdwlan-flame.bin`, plus the modem's `modem.mdt`/`.bNN` and
-    `modemr.jsn`, in `/var/local/fw/modem` on the phone.
-  - Your own modemst1/modemst2/fsg/fsc images go in `/var/local/fw/rmtfs` on the phone (HANDOFF.md, "WiFi, part 1").
-- **Toolchains**: Xcode with the iOS SDK (`work/userland/bin/ios-cc`), Homebrew `llvm`, `lld` and `lz4` for the
-  shim, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build) for the first kernel build,
-  Mesa and metal2vulkan checkouts for `tools/build-turnip-ios.sh` and `tools/build-m2v-bridge.sh` (pins in the
-  script headers), and dropbear, toybox and dash built for iOS (HANDOFF.md, "SSH into iOS works").
+## Building
 
-## Run it
+The first objective is to establish a reproducible build process for the OnePlus 7 Pro.
 
-```sh
-python3 tools/mkadt.py work/boot/flame-hi.adt --highmem     # Apple device tree for flame
-tools/build-xnu.sh $PWD/work/build.log                       # kernel (after one full darwin-xnu-build run)
-cp work/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet work/boot/kernel-0124
-tools/flame-run.sh first -k work/boot/kernel-0124 -s 600 -G -a "sweetusb=2 sweetmtl=2"   # one boot + logs
-# once, with the phone up and FlameBridge running (tools/flamebridge/build.sh, open the app):
-ssh-keygen -t ed25519 -N '' -f work/userland/ssh/id_ed25519 && tools/flame-install-ssh.sh
-tools/flame-fresh-run.sh second 1800 sweetmtl=2              # from then on: boot and wait for SSH
-tools/flame-ssh                                              # root shell in iOS
+Clone the repository:
+
+```bash
+git clone https://github.com/coreycusick/ios-guacamole.git
+cd ios-guacamole
 ```
 
-`tools/flame-run.sh` is the loop underneath. It builds the payload and boot image, runs `fastboot boot`, waits for
-the run to end back in fastboot, boots TWRP, then pulls and decodes the kernel log. NOTES.md and HANDOFF.md
-("How to run things", "Tools") cover each step and the boot args.
+The upstream project provides the starting point for the shim and XNU build processes.
+
+A complete, validated OnePlus 7 Pro build procedure is **not yet available**.
+
+Until the hardware-specific changes are implemented, existing Pixel 4 build scripts should be treated as references only.
+
+## Safety and recovery
+
+This project involves experimental low-level boot code.
+
+Important precautions:
+
+- Keep a copy of the correct GM1917 stock firmware.
+- Back up device-specific partitions, including modem and calibration data, before destructive experiments.
+- Do not flash Pixel 4 images onto the OnePlus.
+- Do not overwrite userdata until the OnePlus storage layout and recovery process have been verified.
+- Prefer temporary `fastboot boot` tests where supported.
+- Never share personal device calibration or modem partition backups publicly.
+
+The upstream iOS implementation disables or replaces parts of Apple's security model. Even if successfully ported, it should not be treated as a secure everyday operating system.
+
+## Upstream functionality
+
+The original [ios-flame](https://github.com/NWylynko/ios-flame) project has demonstrated the following on the Pixel 4:
+
+- Eight-core Snapdragon 855 operation
+- UFS storage and read/write iOS filesystem
+- Adreno 640 GPU rendering
+- Metal translation using Turnip and metal2vulkan
+- SpringBoard and stock iOS applications
+- Touchscreen and hardware buttons
+- Wi-Fi
+- USB networking and SSH
+
+These are **upstream Pixel 4 achievements**, not currently supported features of `ios-guacamole`.
 
 ## Credits
 
-Built on ios-sweet by dipa-studio, with Wi-Fi from ios-topaz and HackiOS, and Metal from UniXNU, metal2vulkan
-and Mesa. Licences and details in [CREDITS.md](CREDITS.md).
+This project builds upon the work of:
+
+- [ios-sweet](https://github.com/dipa-studio/ios-sweet) — Original iOS 16 port to non-Apple ARM64 hardware.
+- [ios-flame](https://github.com/NWylynko/ios-flame) — Snapdragon 855 / Pixel 4 implementation.
+- [ios-topaz](https://github.com/MakrSas/ios-topaz) — Additional Qualcomm hardware and Wi-Fi work.
+- [UniXNU](https://github.com/Un1c0rn0x00/UniXNU) — Related XNU and GPU research.
+- Mesa / Turnip — Open-source Qualcomm Adreno Vulkan drivers.
+- metal2vulkan — Metal translation work.
+
+See the inherited `CREDITS.md` for additional contributors and license information.
+
+---
+
+**Project status:** Early bring-up / hardware porting preparation.
+
+**Target:** OnePlus 7 Pro GM1917 — iOS 16.7.16.
+
+**Last updated:** October 24, 2026.
