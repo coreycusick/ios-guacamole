@@ -16,9 +16,12 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    # GitHub can build this integration branch on its first push even when
+    # workflow_dispatch is unavailable (the fork's default branch differs).
+    branches: [main, wifi-pixel4-stage, wifi-pixel4-latest]
     paths:
       - "xnu/patches/**"
+      - "userland/wifi/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -40,6 +43,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check guacamole Wi-Fi integration inputs
+        run: |
+          if [ -f tools/test-guac-wifi-stage.py ]; then
+            python3 tools/test-guac-wifi-stage.py
+          fi
 
       - name: Fetch build script
         run: |
@@ -122,3 +131,24 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+  wifi-userland:
+    # Build the iOS arm64 radio helper separately from XNU so its compile
+    # errors and its signed artifact are available even if XNU fails.
+    if: startsWith(github.ref_name, 'wifi-pixel4-')
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build WCN3990 radio helper for iOS 16
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          sh userland/wifi/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guacamole-wland
+          path: userland/wifi/out/wland
+          if-no-files-found: error

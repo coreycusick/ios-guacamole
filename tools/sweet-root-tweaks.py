@@ -73,6 +73,19 @@ AUTORUN_JOB = {
 }
 
 
+# Experimental full WCN3990 initialization, after boot: SMP2P -> modem PAS ->
+# WLFW -> radio copy engines -> /dev/wlan -> en0. The program must be installed
+# at /usr/libexec/wland before the job can start; never commit the phone's
+# firmware, credentials, or unique radio/NV partitions to this repository.
+WLAND_KEY = '/System/Library/LaunchDaemons/org.guacamole.wland.plist'
+WLAND_JOB = {
+    'Label': 'org.guacamole.wland',
+    'ProgramArguments': ['/usr/libexec/wland', 'auto'],
+    'RunAtLoad': True,
+    'POSIXSpawnType': 'Interactive',
+}
+
+
 BBD_WRAPPER = '/usr/libexec/sweet-bbd'
 
 
@@ -95,12 +108,13 @@ def launchd_plist(src, dst):
     for k in removed:
         del jobs[k]
     jobs[AUTORUN_KEY] = dict(AUTORUN_JOB)
+    jobs[WLAND_KEY] = dict(WLAND_JOB)
     for job in jobs.values():
         if job.get('Label') == 'com.apple.backboardd':
             job['ProgramArguments'] = [BBD_WRAPPER]
     save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed, '
-          f'{AUTORUN_JOB["Label"]} added, backboardd via {BBD_WRAPPER}')
+          f'{AUTORUN_JOB["Label"]} and {WLAND_JOB["Label"]} added, backboardd via {BBD_WRAPPER}')
 
 
 def containers(root):

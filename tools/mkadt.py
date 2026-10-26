@@ -37,6 +37,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # --highmem window 0x100000000+0xfcc00000 is RAM with no fixed carve-outs, but
 # the low PHYS_BASE window crosses the 0xbbb00000 hole, so use --highmem.
 GUACAMOLE = '--guacamole' in sys.argv
+GUAC_WIFI = '--guacamole-wifi' in sys.argv
 if GUACAMOLE:
     FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
     FB_SIZE = 0x1200000
@@ -218,6 +219,13 @@ def build(seed=None, qemu=False, highmem=False):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        # Opt in only with --guacamole-wifi: wifid's launchd job matches a
+        # device-tree 'wlan' node, but the real radio needs /dev/wlan + wland.
+        *([node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('guacamole,wcn3990')),
+        ])] if GUAC_WIFI and not qemu else []),
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
@@ -279,6 +287,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
+    if GUAC_WIFI and not GUACAMOLE:
+        sys.exit('--guacamole-wifi also requires --guacamole')
     if GUACAMOLE and '--highmem' not in sys.argv:
         sys.exit('--guacamole needs --highmem (the low window crosses a DDR hole)')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)

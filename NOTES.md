@@ -1,5 +1,70 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## Guacamole Actions build + GPU/display isolation (2026-10-26)
+
+The `wifi-pixel4-latest` branch now triggers `.github/workflows/xnu.yml`
+on relevant pushes and runs a host-only integration check before attempting
+the XNU kernel build. It also attempts a separate iPhoneOS `wland` build so
+one job's failure will not hide errors in the other. Actions has **not run
+yet** on the integrated patches.
+The independent OtVaL GPU G2b/G3 tests were reported working, but visible
+G4 display is unfinished and has produced a black screen due to a wide-colour
+IOSurface attachment issue. Guacamole boot packaging now defaults to
+`sweetgpu=0 sweetgl=0` for Wi-Fi/display isolation; `GPU_STAGE=11 GL_UI=0`
+can initialize GPU hardware while retaining the software UI, and
+`GPU_STAGE=11 GL_UI=1` explicitly opts into experimental acceleration.
+The boot helper continues to default to `cpus=8` and never flashes the phone.
+
+## Guacamole Wi-Fi initialization enabled (2026-10-26, second milestone)
+
+Per Corey's explicit request, the experimental `wifi-pixel4-stage` branch now
+permits hardware initialization: `GUAC_WIFI_HARDWARE_ENABLED=1` and tentative
+DMA pool `0xe0000000+0x01000000` (inside known low DDR, firmware ownership
+unconfirmed). `wland up` calls SMMU setup, OnePlus-power *candidate* votes,
+SMP2P, modem PAS, WLFW, radio CE and networking; it now stops immediately on
+SMMU setup failure. Boot script `WIFI=1` by default adds the WLAN ADT node,
+`sweetpmem=1 sweetwifid=1 sweetwifi=1`, and all eight CPUs. Four source
+candidate patches were copied into active `xnu/patches/0130`–`0133` on this
+branch. Root tweaks add launchd `org.guacamole.wland` to run `wland auto`;
+`userland/build.sh` invokes the Wi-Fi build and stages the signed executable.
+
+**Not yet built or hardware-tested.** The OnePlus regulators `0xe9`–`0xec`
+still have no resolved resource names: power votes are borrowed from Pixel4.
+The experimental DMA pool remains unverified against all live firmware
+allocations. There is no handset firmware or BDF in the repo. The XNU patch
+sequence may need conflict resolution. Do not alter the working iOS image or
+flash a boot partition: only temporary `fastboot boot` testing after building
+and arranging the separate userland files.
+
+## Guacamole Wi-Fi source staging (2026-10-26, branch `wifi-pixel4-stage`)
+
+**Source changes staged, not yet kernel-built or phone-tested.** Brought
+`NWylynko/ios-flame`'s `phone/wifi` WCN3990 radio and `/dev/wlan` bridge
+into `userland/wifi` without modifying the working OnePlus boot code. The
+new `docs/guacamole-wifi.md` identifies the board-specific blockers. The
+hardware lock in `guac_board.h` defaults off; the unverified DMA pool
+defaults to 0. **Confirmed from Corey's merged GM1917 DTB:** the modem
+starts at `0x8dc00000` (same as Pixel), but its size is `0x9600000`,
+NOT Pixel's `0xb400000`. WLAN reserved `0x8bc00000+0x180000`, MSA
+requested `0x100000`; controller `0x18800000`; apps SMMU `0x15000000`,
+stream `0x640/0x1`. Four Wi-Fi regulator phandles `0xe9`–`0xec` need
+resolution; DMA pool remains unselected. All hardware access commands refuse
+to run until the board is audited. Pixel BDF and calibration are not used.
+
+`tools/guac-wifi-mkpatches.py` stages curated candidate XNU patches from
+Pixel 0094/0102/0123/0124 (pmem, RPMh, Apple80211/en0, linked-BSS cache)
+under `userland/wifi/kernel-patch-candidates`; they are **not installed** into
+the guacamole XNU patch sequence, and the synthetic pmem/wlan devices now
+default off. Opt-in `--guacamole-wifi` ADT node (`WIFI=1 guac-mkboot.sh`),
+not enabled for normal images. `tools/test-guac-wifi-stage.py` PASS on host:
+ADT wlan absent/present as requested; all 4 candidate patches parse with
+`git apply --stat`; hardware guards asserted. An actual `git apply --check`
+against the latest patched guacamole XNU, macOS iOS-SDK `wland` compile,
+kernel build, and device scans are still pending. **Keep known-good iOS
+image and root untouched.** Next: inspect merged OnePlus DTB before enabling
+any modem/SMC/SMMU write; then resolve candidate patch conflicts in the
+OnePlus XNU worktree and build the kernel separately.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

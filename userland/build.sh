@@ -21,6 +21,8 @@ build sweet-bbd bbd/sweet-bbd.c
 build libsweet-bbd.dylib bbd/bbd-insert.c -dynamiclib -install_name /usr/lib/libsweet-bbd.dylib \
 	-framework IOKit -framework CoreFoundation
 build libsweet-insert-test.dylib dyldtest/insert-test.c -dynamiclib -install_name /private/var/tmp/libsweet-insert-test.dylib
+wifi/build.sh
+cp wifi/out/wland out/wland
 # G3: needs userland/mesa/mk-mesa.sh first (libOSMesa.8.dylib + headers)
 MESA=mesa/build
 if [ -f $MESA/out/libOSMesa.8.dylib ]; then
