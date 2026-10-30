@@ -1,18 +1,13 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,11 @@
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
- bsd/dev/sweet_gpu.c			standard
- bsd/dev/sweet_mailbox.c			standard
+@@ -112,1 +112,6 @@
 +bsd/dev/redwood_sta.c		standard
 +bsd/dev/redwood_net.c		standard
 +bsd/dev/redwood_apple80211.c	standard
 +bsd/dev/flame_sta.c		standard
 +bsd/dev/flame_wlan.c		standard
  bsd/dev/mem.c				standard
- bsd/dev/munge.c			optional config_requires_u32_munging
 diff --git a/bsd/dev/flame_sta.c b/bsd/dev/flame_sta.c
 new file mode 100644
 index 000000000..7e40bda73
@@ -2818,12 +2813,7 @@ diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 index e58774a52..898752dfe 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
-@@ -18,6 +18,8 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
- iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
- iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
- iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+@@ -18,1 +18,3 @@
 +iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
 +iokit/Kernel/arm/MiniIONetworkStack.cpp                          optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
