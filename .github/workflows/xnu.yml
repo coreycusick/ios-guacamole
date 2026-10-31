@@ -74,6 +74,13 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      - name: Verify Wi-Fi and PMEM integration
+        if: always()
+        run: |
+          test -s dxb/xnu/bsd/dev/sweet_pmem.c
+          grep -Fq 'bsd/dev/sweet_pmem.c' dxb/xnu/bsd/conf/files
+          grep -Fq 'sweet_pmem_init();' dxb/xnu/bsd/dev/sweet_ufs.c
+          grep -Fq 'flame_wlan_init();' dxb/xnu/bsd/dev/sweet_ufs.c
       - name: Package build tree for local compiles
         if: always()
         run: |

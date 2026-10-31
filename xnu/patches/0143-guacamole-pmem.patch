@@ -1,12 +1,9 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,4 +112,5 @@
- bsd/dev/flame_sta.c		standard
- bsd/dev/flame_wlan.c		standard
+@@ -112,1 +112,2 @@
 +bsd/dev/sweet_pmem.c			standard
  bsd/dev/mem.c				standard
- bsd/dev/munge.c			optional config_requires_u32_munging
 diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
 new file mode 100644
 index 000000000..99cfdd8dd
@@ -364,16 +361,9 @@ index 000000000..99cfdd8dd
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -54,5 +54,6 @@
- extern void sweet_gpu_probe(void);
- extern void sweet_mailbox_probe(void);
+@@ -54,1 +54,2 @@
  extern void flame_wlan_init(void);
 +extern void sweet_pmem_init(void);
-
- #define REG_CAP         0x00
-@@ -663,4 +664,5 @@
- 	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
- 	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
+@@ -663,1 +664,2 @@
  	flame_wlan_init();	/* /dev/wlan and en0 bridge for wland */
 +	sweet_pmem_init();	/* /dev/pmem for wland */
- 	return 0;
