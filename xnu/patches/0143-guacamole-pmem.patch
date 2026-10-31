@@ -361,9 +361,19 @@ index 000000000..99cfdd8dd
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -54,1 +54,2 @@
+@@ -56,6 +56,7 @@
+ extern void sweet_gpu_probe(void);
+ extern void sweet_mailbox_probe(void);
  extern void flame_wlan_init(void);
 +extern void sweet_pmem_init(void);
-@@ -663,1 +664,2 @@
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -666,6 +667,7 @@
+ 	sweet_gpu_probe();	/* GUACAMOLE: boot-arg sweetgpu=N */
+ 	sweet_mailbox_probe();	/* GUACAMOLE: boot-arg sweetmailbox=1 */
  	flame_wlan_init();	/* /dev/wlan and en0 bridge for wland */
 +	sweet_pmem_init();	/* /dev/pmem for wland */
+ 	return 0;
+ }
+ 
