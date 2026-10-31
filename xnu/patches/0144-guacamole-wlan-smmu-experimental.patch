@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/sweet_pmem.c b/bsd/dev/sweet_pmem.c
+--- a/bsd/dev/sweet_pmem.c
++++ b/bsd/dev/sweet_pmem.c
+@@ -285,6 +285,124 @@
+ 	return 0;
+ }
+ 
++
++/*
++ * EXPERIMENTAL Qualcomm qsmmu-v500 WLAN stream attach (SID 0x640).
++ * Must run AFTER the WLAN clock and firmware have been brought up.
++ * Disabled unless sweetwlansmmu=1 was supplied as a boot argument.
++ * Accessing a powered-off/protected SMMU can reset the SoC; the boot
++ * argument does NOT make those accesses safe. This is only for recoverable
++ * development devices, with a known-good temporary boot image available.
++ *
++ * This opts into a dedicated TRANSLATION-OFF S1 context bank. It NEVER
++ * edits an existing stream/context. It does not make an IOVA mapping or
++ * guarantee that the hypervisor's stage-2 DMA policy permits the stream.
++ */
++#define GUAC_WLAN_SMMU_PA    0x15000000ULL
++#define GUAC_WLAN_SMMU_SZ    0x100000ULL
++#define GUAC_WLAN_SID        0x640u
++#define GUAC_SMMU_SMR_MAX    128u
++#define GUAC_SMMU_CB_MAX     128u
++
++static inline uint32_t
++guac_as_rd(volatile uint8_t *p, uint64_t off)
++{
++    return *(volatile uint32_t *)(p + off);
++}
++static inline void
++guac_as_wr(volatile uint8_t *p, uint64_t off, uint32_t val)
++{
++    *(volatile uint32_t *)(p + off) = val;
++    __asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static int
++guac_wlan_attach(void)
++{
++    int enabled = 0;
++    PE_parse_boot_argn("sweetwlansmmu", &enabled, sizeof(enabled));
++    if (!enabled) return EPERM;
++
++    vm_offset_t va = ml_io_map_unmappable((vm_offset_t)GUAC_WLAN_SMMU_PA,
++            GUAC_WLAN_SMMU_SZ, VM_WIMG_IO);
++    if (!va) return ENOMEM;
++    volatile uint8_t *as = (volatile uint8_t *)va;
++    int ret = ENXIO;
++    /* The first read can still CrashDump if the TCU is inaccessible. */
++    uint32_t id0 = guac_as_rd(as, 0x20), id1 = guac_as_rd(as, 0x24);
++    unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++    uint64_t pagesz = (id1 & (1u << 31)) ? 0x10000ULL : 0x1000ULL;
++    unsigned shift = ((id1 >> 28) & 7u) + 1u;
++    uint64_t cbbase = (1ULL << shift) * pagesz;
++    if (!(id0 & (1u << 27)) || nsmr == 0 || nsmr > GUAC_SMMU_SMR_MAX ||
++        ncb == 0 || ncb > GUAC_SMMU_CB_MAX ||
++        cbbase >= GUAC_WLAN_SMMU_SZ ||
++        cbbase + (uint64_t)ncb * pagesz > GUAC_WLAN_SMMU_SZ ||
++        0xc00ULL + 4ULL*nsmr > pagesz ||
++        pagesz + 0x800ULL + 4ULL*ncb > cbbase)
++        goto done;
++
++    uint64_t occupied[2] = {0, 0};
++    int free_smr = -1;
++    for (unsigned i = 0; i < nsmr; ++i) {
++        uint32_t smr = guac_as_rd(as, 0x800 + 4*i);
++        uint32_t s2cr = guac_as_rd(as, 0xc00 + 4*i);
++        if (!(smr & (1u << 31))) {
++            if (free_smr < 0) free_smr = (int)i;
++            continue;
++        }
++        unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
++        if (type == 0 && cb < ncb)
++            occupied[cb / 64] |= 1ULL << (cb % 64);
++        unsigned id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++        if (((id ^ GUAC_WLAN_SID) & ~mask & 0x7fffu) != 0)
++            continue;
++        /* A matching S2CR has already been allocated: never overwrite it. */
++        if (type != 0 || cb >= ncb) goto done;
++        uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
++        uint32_t sctlr = guac_as_rd(as, cboff);
++        uint32_t cbar = guac_as_rd(as, pagesz + 4*cb);
++        if (!(sctlr & 1u) && (cbar & 0x1f000u) == 0x1f000u) {
++            ret = 0; /* existing stage-1-disabled, stage-2-bypass bank */
++        }
++        goto done;
++    }
++    if (free_smr < 0) goto done;
++    int free_cb = -1;
++    for (unsigned c = 0; c < ncb; ++c) {
++        if (occupied[c / 64] & (1ULL << (c % 64))) continue;
++        uint64_t off = cbbase + (uint64_t)c*pagesz;
++        if (guac_as_rd(as, off) == 0 &&
++            guac_as_rd(as, pagesz + 4*c) == 0 &&
++            guac_as_rd(as, pagesz + 0x800 + 4*c) == 0) {
++            free_cb = (int)c;
++            break;
++        }
++    }
++    if (free_cb < 0) goto done;
++
++    /* Configure ONLY unowned entries; exact 0x640 match, no 0x641 wildcard. */
++    unsigned cb = (unsigned)free_cb, idx = (unsigned)free_smr;
++    uint64_t cboff = cbbase + (uint64_t)cb*pagesz;
++    guac_as_wr(as, cboff, 0xe0u);                       /* SCTLR.M=0 */
++    guac_as_wr(as, pagesz + 0x800 + 4*cb, 1u);        /* AArch64 */
++    guac_as_wr(as, pagesz + 4*cb, 0x1f000u);          /* S1, S2 bypass */
++    guac_as_wr(as, 0xc00 + 4*idx, cb);                /* S2CR translate via cb */
++    guac_as_wr(as, 0x800 + 4*idx, (1u << 31) | GUAC_WLAN_SID);
++    if (guac_as_rd(as, 0x800 + 4*idx) == ((1u << 31) | GUAC_WLAN_SID) &&
++        (guac_as_rd(as, 0xc00 + 4*idx) & 0x300ffu) == cb &&
++        !(guac_as_rd(as, cboff) & 1u)) {
++        ret = 0;
++    } else {
++        /* If verification failed, invalidate the newly added stream entry. */
++        guac_as_wr(as, 0x800 + 4*idx, 0);
++        ret = EIO;
++    }
++done:
++    ml_io_unmap(va, GUAC_WLAN_SMMU_SZ);
++    return ret;
++}
++
+ static int
+ pm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
+ {
+@@ -296,6 +414,9 @@
+ 		break;
+ 	case PMEM_ALLOC32:
+ 		err = pm_do_alloc((struct pmem_alloc *)data, true);
++		break;
++	case _IO('P', 7):
++		err = guac_wlan_attach();
+ 		break;
+ 	case PMEM_FREE: {
+ 		uint64_t pa = *(uint64_t *)data;
