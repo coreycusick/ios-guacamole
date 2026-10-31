@@ -9,7 +9,7 @@ new file mode 100644
 index 000000000..99cfdd8dd
 --- /dev/null
 +++ b/bsd/dev/sweet_pmem.c
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,368 @@
 +/*
 + * /dev/pmem: physical memory for userland hardware experiments (the GPU
 + * bring-up in work/userland/gpu runs on it over SSH, no reboot per try).
@@ -74,6 +74,7 @@ index 000000000..99cfdd8dd
 +	} ent[PMEM_LIST_MAX];
 +};
 +#define PMEM_ALLOC      _IOWR('P', 1, struct pmem_alloc)
++#define PMEM_ALLOC32    _IOWR('P', 6, struct pmem_alloc)
 +#define PMEM_FREE       _IOW('P', 2, uint64_t)
 +#define PMEM_SMC        _IOWR('P', 3, struct pmem_smc)
 +#define PMEM_LIST       _IOR('P', 4, struct pmem_list)
@@ -244,11 +245,19 @@ index 000000000..99cfdd8dd
 +}
 +
 +static int
-+pm_do_alloc(struct pmem_alloc *a)
++pm_do_alloc(struct pmem_alloc *a, bool below4g)
 +{
++	/* Check input before round_page() can overflow. */
++	if (below4g && (a->size == 0 || a->size > 0x100000000ULL - PAGE_MASK)) {
++		return EINVAL;
++	}
 +	vm_size_t size = round_page(a->size);
 +	uint64_t align = a->align > PAGE_SIZE ? a->align : PAGE_SIZE;
 +	if (size == 0 || (align & (align - 1))) {
++		return EINVAL;
++	}
++	/* No low-memory request may wrap the page rounding or 4 GiB boundary. */
++	if (below4g && (a->size > 0x100000000ULL || size > 0x100000000ULL)) {
 +		return EINVAL;
 +	}
 +	int slot = -1;
@@ -262,7 +271,8 @@ index 000000000..99cfdd8dd
 +		return ENOSPC;
 +	}
 +	vm_offset_t va = 0;
-+	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, 0, (ppnum_t)(atop_64(align) - 1),
++	ppnum_t max_pnum = below4g ? (ppnum_t)(atop_64(0x100000000ULL) - 1) : 0;
++	if (kmem_alloc_contig(kernel_map, &va, size, PAGE_MASK, max_pnum, (ppnum_t)(atop_64(align) - 1),
 +	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return ENOMEM;
 +	}
@@ -272,6 +282,13 @@ index 000000000..99cfdd8dd
 +		return ENOMEM;
 +	}
 +	a->pa = ptoa_64(pn);
++	/* Check the entire run, not only its first page. Never fall back. */
++	if (below4g && (a->pa >= 0x100000000ULL ||
++	    (uint64_t)size > 0x100000000ULL - a->pa)) {
++		kmem_free(kernel_map, va, size);
++		a->pa = 0;
++		return ERANGE;
++	}
 +	flush_dcache64((addr64_t)a->pa, (unsigned)size, TRUE);
 +	pm_alloc[slot].va = va;
 +	pm_alloc[slot].pa = a->pa;
@@ -287,7 +304,10 @@ index 000000000..99cfdd8dd
 +	lck_mtx_lock(&sweet_pmem_lock);
 +	switch (cmd) {
 +	case PMEM_ALLOC:
-+		err = pm_do_alloc((struct pmem_alloc *)data);
++		err = pm_do_alloc((struct pmem_alloc *)data, false);
++		break;
++	case PMEM_ALLOC32:
++		err = pm_do_alloc((struct pmem_alloc *)data, true);
 +		break;
 +	case PMEM_FREE: {
 +		uint64_t pa = *(uint64_t *)data;
