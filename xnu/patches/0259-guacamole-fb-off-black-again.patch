@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -144,6 +144,8 @@
+ #include <kern/kern_types.h>   /* 0169: THREAD_UNINT, THREAD_TIMED_OUT */
+ #include <sys/proc.h>
+ 
++#define SWEET_FB_OFF_CLEARS 30u        /* 0259: vsyncs the panel is cleared again after display off */
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -769,16 +771,28 @@
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/*
+-		 * Black, once. 0132: the fade (halving every pixel on 7 vsyncs) read back the
++		 * Black. 0132: the fade (halving every pixel on 7 vsyncs) read back the
+ 		 * write-combined panel memory, slowly enough to be seen frame by frame.
++		 * 0259: not just once: a GPU present that was already queued when the display went off (backboardd's
++		 * dimmed last frame, 0150 presents at swap time) can land after the first clear and stay on the panel
++		 * ("locks, dims a bit, does not go black"). So clear again on the next SWEET_FB_OFF_CLEARS vsyncs
++		 * (~0.5 s), each under fPresentLock so no present runs at the same time; nothing presents while off.
+ 		 */
+ 		uint32_t step = fb->fFadeStep;
+-		fb->fFadeStep = 1;
++		if (step < SWEET_FB_OFF_CLEARS) {
++			fb->fFadeStep = step + 1;
++		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step == 0) {
++		if (step < SWEET_FB_OFF_CLEARS) {
++			if (fb->fPresentLock != NULL) {
++				IOLockLock(fb->fPresentLock);
++			}
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
++			if (fb->fPresentLock != NULL) {
++				IOLockUnlock(fb->fPresentLock);
++			}
+ 		}
+ 		sender->setTimeoutUS(sweet_fb_next_tick_us());   /* 0198 */
+ 		return;

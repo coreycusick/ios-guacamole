@@ -1,3 +1,206 @@
+# Active handoff — dual boot: Alert Slider boot selector in the shim (2026-11-12 17:50, Claude)
+
+- Layout: slot a boot_a = Android 12 userdebug + Magisk (header v2, UNCOMPRESSED_IMG 48.5 MB Image, text_offset
+  0x80000, 12.9 MB ramdisk); slot b boot_b = shim + SWEETXNU payload. Same DTB section in both. GPT (LUN0):
+  userdata 64 GiB, ios26 46 GiB (blank), ios 116.83 GiB (ufsroot=ios); old GPT in dtb/sda-gpt-{head,tail}.bin.
+- shim/bootsel.c reads the slider (TLMM gpio125/134/27, pull-down cleared): top low=1, middle low=2 (verified on
+  the phone, step 1 photos). ABL (fastboot boot): shim at 0x80080000, DTB 0x843A3000 (0xAD409), initrd
+  0x845A4000-0x855FE240; bootargs = DT prefix + header cmdline (console=null) + ABL androidboot.* additions
+  (slot_suffix, root=PARTUUID=<system_x>, skip_initramfs ...).
+- Step 2 (shim/android.c, ufs.c ufs_open/ufs_find/ufs_read, fdt.c fdt_rebuild_chosen, start.S linux_tramp):
+  slider top -> read boot_a whole from UFS to 0x100000000, ramdisk to ABL's initrd spot, new DTB (bootargs with
+  boot_a's header cmdline instead of console=null, slot _b->_a, root=PARTUUID=system_a) behind it, trampoline
+  copies the Image to 0x80080000 and enters Linux (x0 = DTB). Middle/bottom -> iOS as before. Test image (tethered,
+  current iOS payload from boot_b): step2 hit an alignment fault (Image 4-byte aligned behind UNCOMPRESSED_IMG,
+  MMU off = Device memory); fixed by sliding it to the page start. shim/out/bootsel-step3.img (sha256 58068312...)
+  BOOTED ANDROID (tethered, slot a active, 2026-11-12 17:53).
+- Not yet: flashing to boot_b with slot b active; then check dtbo_a == dtbo_b (ABL applies the active slot's dtbo).
+  If Android fails after the ramdisk copy the iOS payload is overwritten (fallback shows the error, then resets).
+
+# Active handoff — Alert Slider + speaker-amp bring-up ported from upstream (2026-11-12 17:00, Claude)
+
+- From OtVaL228/ios-sweet guacamole (we forked at their 0216828): fc1dcb1 Alert Slider only (NOT its Wi-Fi 0159 /
+  wland change), ed7afa8 audio bring-up (userland/adsp: adspd, edge, tfa). Their 0158 is our
+  `xnu/patches/0264-guacamole-alert-slider-ringer.patch` (sweet_keys.c + SweetHID; `git apply --check` OK on
+  work/xnu-local-latest/dxb/xnu, which already has 0263). userland/build.sh builds adspd, tfa, slider.
+- FOR CODEX: build a kernel with 0264 on top of the current image. Phone after boot: `mgtool setbool
+  ringer-switch true`, respring; bottom = ring, top/middle = silent (sweetslider=0 off, =2 inverted).
+- Also ported: Files app + Safari downloads (upstream f0c75ce, 1936ee5): their 0161 -> our
+  `0265-guacamole-fpfs-syncroot-hfs.patch`, their 0164 -> `0266-guacamole-fpfs-placeholder-ioctl.patch` (both
+  apply in order on the work tree, after 0264). Their 0160 (sandbox containers) NOT ported: conflicts with our
+  0201/0202 which already answer op 4; kept in research/upstream/ in case the LocalStorage extension still lacks a
+  container. Userland: fpwrap, libsweet-fpfs.dylib (build.sh). Phone: copy to /var/local/bin/fpwrap and
+  /var/local/lib/libsweet-fpfs.dylib, then `tools/sweet-root-tweaks.py --job-program com.apple.FileProvider
+  /var/local/bin/fpwrap IN OUT` on launchd.plist (keep a .pre-fpwrap backup).
+- adspd/tfa: no sound yet (AFE/ASM/ADM never answer upstream either). adspd boots the ADSP ONCE per phone boot:
+  a second boot of the ADSP crashed the modem (Wi-Fi gone) upstream; use `adspd serve` / FIFO. Firmware in
+  /var/local/fw/adsp (modem_b image/adsp.*), tfa needs the vendor tfa98xx.cnt. Docs: guacamole.md Audio section.
+
+# Active handoff — app keychain -34018: kernel drops CS_VALID (0263, 2026-11-11 16:10, Claude)
+
+- Minecraft (minecraftpe 1.26.60) aborts at launch: `-[KeychainItemWrapper writeToKeychain]` assertion
+  "Couldn't add the Keychain Item." securityd: -34018 "Client has neither application-identifier nor
+  keychain-access-groups entitlements"; `SecTaskLoadEntitlements failed error=22 cs_flags=26000000`.
+- Cause: right after exec one page fails its hash -> `cs_invalid_page ... allowing (remove VALID)`. csops
+  CS_OPS_ENTITLEMENTS_BLOB / CS_OPS_DER_ENTITLEMENTS_BLOB return EINVAL without CS_VALID|CS_DEBUGGED, so the
+  app has no entitlements for securityd (and anything else using SecTask).
+- 0263 applied and built successfully on top of the current 0262/0259 kernel tree. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,055,856 bytes,
+  SHA-256 `2c67535fa67e9e3ca1e39095c0c8f169af7f21dc63da81bda8f12c214a6db4e7`). The patch applies on SWEET only:
+  `cs_invalid_page` keeps `CS_VALID` while allowing the page, leaves `CS_KILL` and `CS_HARD` unchanged, and logs
+  the first 32 cases as `SWEET keeps VALID`.
+- Built a fresh `--highmem --guacamole` ADT and boot image `outputs/guacamole-0263-cs-keep-valid.img`
+  (21,598,208 bytes, SHA-256 `23dfc647a9d6920a937e794af98e781c8d0024d9e2e792b3b5ad751c044c83c2`). It uses the
+  0262 boot arguments with `sweettime` refreshed; exact args are in
+  `outputs/guacamole-0263-cs-keep-valid-boot-args.txt`. Built locally, not transferred or booted.
+  Check: Minecraft past the logo; `dmesg | grep "keeps VALID"`; no -34018 in securityd oslog.
+- Candy Crush: fixed by the user with the OpenGL ES fix. Phone IP is now 192.168.0.63.
+- oslog is at /usr/local/bin/oslog (not /var/local/bin).
+
+# Active handoff — 0255 Actuator + Request J / 0258 AW8697 recovery (2026-11-11 05:47)
+
+- Added `xnu/patches/0258-guacamole-haptic-ios-wedge-recovery.patch` after 0255. It writes the iOS-selected gain
+  before GO, recovers the AW8697 after a 120 ms stop timeout or a one-shot still in RAM_GO after 300 ms, reduces the
+  low-end loop gain, rate-limits tap/loop logs to one per second, and exposes `kern.sweet_haptic_ios` counters.
+- 0255 and 0258 applied cleanly; kernel build succeeded with the current 0262 scaler patch present. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,055,808 bytes,
+  SHA-256 `edff793a35bd28a2e6a2818336dcf60f2d91626331ce776a547a124b58f67db0`).
+- Built a fresh `--highmem --guacamole` ADT and boot image:
+  `outputs/guacamole-0258-request-j-0255.img` (21,598,208 bytes, SHA-256
+  `68d583e3af7a5cc9d6d06a61d23ad57540a9d8080dded7bf1a6fc31074d30d03`). It retains the current 60 Hz GPU-present
+  args, `sweethaptic=2`, `sweetaudio=0`, and refreshed `sweettime`; exact args are in
+  `outputs/guacamole-0258-request-j-0255-boot-args.txt`. Built locally; not transferred or booted.
+
+# Active handoff — AppleM2ScalerCSCDriver CPU stand-in (2026-11-11 05:36)
+
+- Built `xnu/patches/0262-guacamole-m2scaler-cpu-standin.patch` on the current
+  0259 tree using `XNU_LOCAL="$PWD/work/xnu-local-latest" sh
+  tools/xnu-local-build.sh`. The build succeeds; remaining new-driver warnings
+  are generated-class/designator warnings. Kernel SHA-256:
+  `41851d170d9a8600ce89c160747cdcdf96c023e2bdab30113d8031061227d7e7`.
+- Built fresh `work/guacamole-0262-m2scaler-cpu-standin.adt` with current
+  `mkadt.py --highmem --guacamole`, payload, and
+  `outputs/guacamole-0262-m2scaler-cpu-standin.img` (SHA-256
+  `2f71e3597b41e849c57c5423ecaa079f584e87d2325af751f294886ee7150531`).
+  Boot arguments match the working 0259 image with only `sweettime` refreshed;
+  exact line is in `outputs/guacamole-0262-m2scaler-cpu-standin-boot-args.txt`.
+  The 0259 fallback remains intact. The new image has not been copied or booted.
+- Protocol correction: ordinary Create (no SRS options) matches
+  `AppleM2ScalerCSCDriver`, opens type 0, and selector 1 receives 0x170 bytes.
+  Destination/source IDs are at offsets 0/4. The 0x58-byte request is a separate
+  SRS mode. TransferSurface passes null rectangles; TransformSurface has rect
+  records at 0x28 and 0x58. The stand-in scales/converts full surfaces and logs
+  `SWEET SCALER:`; it rejects nonzero rects until their full encoding and clip
+  semantics are established. QuartzCore evidence still does not prove
+  PosterBoard snapshots use this path. Full findings and limits:
+  `research/snapshot/REQUEST-K-results.md`.
+
+# Active handoff — haptics need MobileGestalt answers that a new boot image drops -> ADT /product/haptics (2026-11-11 05:15, Claude)
+
+- After a new boot image MobileGestalt rebuilt its cache (49 answers): DeviceSupportsHaptics and
+  DeviceSupportsClosedLoopHaptics (set by hand with mgtool) were gone -> no VirtualAudioDevice_Actuator -> no haptics.
+  Re-set by hand meanwhile (mgtool setbool both true, restart mediaserverd/SpringBoard).
+- CHANGE tools/mkadt.py (--guacamole): adds the real D22AP /product/haptics {closed-loop 1, supports-3rd-party-haptics
+  1} (was deliberately left out before HakiosAudio). MobileGestalt reads IODeviceTree:/product/haptics when it builds
+  its cache, so the answers should survive cache rebuilds. Verify after the next image: `mgtool get
+  DeviceSupportsHaptics DeviceSupportsClosedLoopHaptics` (no mgtool set). --no-product-haptics = old tree.
+  Unverified: whether DeviceSupportsHaptics (not only ClosedLoop) comes from this node; if not, it stays an mgtool set.
+
+# Active handoff — black extension wallpapers = black render-server snapshots: no AppleM2ScalerCSCDriver (2026-11-11 05:00, Claude)
+
+- Extension-drawn wallpapers black, PosterBoard-drawn (Color) fine. Snapshot path: FrontBoardServices
+  CARenderServerCreateSnapshots(0,...) -> backboardd. Reproducer userland/jb/caprobe.c: `caprobe shot LCD` returns
+  success but 64/64 black, with no GPU work in backboardd; `caprobe accel`: IOSurfaceAcceleratorCreate fails
+  ("IOServiceMatchingfailed for: AppleM2ScalerCSCDriver"). Likely: CA copies the composited display via the 2D scaler.
+  research/snapshot/REQUEST-K.md asks Codex to confirm in QuartzCore and build a CPU AppleM2ScalerCSCDriver stand-in.
+  Probably also fixes screenshots, app-switcher snapshots, etc.
+
+# Active handoff — photo wallpaper black at "Set as wallpaper pair" (0260 compute trace) (2026-11-11 04:30, Claude)
+
+- User: photo preview in PhotosPicker is fine (ycbcr surf draws); the next screen ("set both", PosterBoard's
+  lock/home previews) and the wallpaper are black. mtl2.log: PosterBoard's 1125x2436 BGRA poster surfaces 0x620/0x6c5
+  are 64/64 black; PhotosPosterProvider (renders the poster) commits only compute work (dispatches, no draws) + "heap
+  full ... resource made outside the heap"; backboardd converts the photo's '420f' 606x1145 fine.
+- So the poster is produced by compute kernels (CoreImage / Photos) whose output is black. NEW 0260 in
+  NativeBridgeMetalFrontend.mm (only with /var/local/mtl2-trace): logs each distinct compute dispatch with kernel name
+  and every bound texture (size, format, usage, surface, ycbcr tag): "native-metal: compute dispatch ...".
+  Build the metal2 bundle, install, then: touch /var/local/mtl2-trace; : > /var/local/mtl2.log; set the photo
+  wallpaper; grep -a "compute dispatch" /var/local/mtl2.log.
+- RESULT 0260 (04:28): PhotosPosterProvider runs CoreImage/MPS kernels (ci_*, mps_stgf_*); source photo = surf 0xaee
+  638x1145 fmt 71 (RGBA8 sRGB, read); final outputs written as fmt 70 (RGBA8, ShaderWrite) into surfaces 0xaf9/0xafb/
+  0xb12/0xb15/0xb2c/... 606/638/530 x1146; some 606x1145 4:2:0 surfaces read as R8 (fmt 10) + RG8 (fmt 30) planes.
+- RESULT 0261 + tests (04:30-04:41): NOT a decode or compute bug. Photo input (globe = mostly black, correct) and a
+  bright photo both go through CoreImage correctly (outputs = YCbCr, Y matches). Lock/home show PosterBoard SNAPSHOTS:
+  PosterBoard renders "com.apple.coreanimation.iosurface-destination" 1125x2436 with ONE draw (2676 px) into an
+  already-black surface, then 375x811 previews; SBRendererService/backboardd only blur those black snapshots. User
+  test: Color/gradient wallpapers (drawn by PosterBoard) WORK; every extension-drawn one (Photos, Pride, Weather,
+  Astronomy, Emoji, Collections) is BLACK. => the remote (extension-context) part of poster snapshots renders empty.
+  NEXT: find how PosterBoard/PosterKit snapshots extension scenes (FrontBoard scene snapshot -> CA render server
+  snapshot in backboardd? or CALayerHost rendered locally) and why the remote context contributes no pixels.
+- NEW 0261 (same file, tracing only): CPU 8x8 sample of every IOSurface texture a kernel uses: inputs at dispatch
+  ("compute input"), outputs after completion ("compute output ... black N/64, mean r g b a"). Tells whether the
+  photo input is black or the kernels' surface writes never land.
+- Codex rebuilt and installed 0261 on `192.168.0.61`; the first build exposed two compile issues, fixed by including
+  `IOKit/IOReturn.h` and declaring `NBCommandBuffer`'s existing `addCompletedHandler:` method in its interface.
+  Ad-hoc signature verified; installed `SweetMetal2`, Turnip, and CodeResources match the build byte-for-byte. Prior
+  bundle preserved as `SweetMetal2.bundle.pre-0261-20261111-0430`. `SweetMetal2` SHA-256:
+  `6b0855efa8430cfe43dadc3a22bb217ead20b09466c94668c343e164b8a29b4b`. Resprung with `killall -9 backboardd`;
+  no reboot. Archive: `outputs/guacamole-SweetMetal2-0261-compute-samples-20261111-0430.tar.gz`.
+- Codex rebuilt with `METAL_WORK="$PWD/../metal-work" sh userland/metal2/build.sh`, verified the ad-hoc signature,
+  installed on `192.168.0.61`, and byte-compared the installed `SweetMetal2`, Turnip, and CodeResources. Previous bundle
+  preserved as `SweetMetal2.bundle.pre-codex-20261111-0422`. `SweetMetal2` SHA-256:
+  `44d786d4154a27b157a90a731a7d5f3dc99bc8a1acbdb48861f2118c94fa4f11`. Resprung with `killall -9 backboardd`;
+  no reboot. Archive: `outputs/guacamole-SweetMetal2-current-20261111-0422.tar.gz`.
+
+# Active handoff — 0259 lock screen stays dimmed (2026-11-11 04:20, Claude)
+
+- User: locking sometimes dims the screen and stays (no black). Display off = IOMFB selector 12 RequestPowerChange(0)
+  (0079): the vsync timer cleared the panel ONCE (0132); a GPU present already queued (0150 present-at-swap, the
+  dimmed last frame) can land after that clear. NEW xnu/patches/0259-guacamole-fb-off-black-again.patch
+  (SweetFramebuffer.cpp, made against work/xnu-local-latest): clear on the first 30 vsyncs after off, each under
+  fPresentLock. If the bug persists, check whether `SWEET FB: display off` appears at all when it happens
+  (then it is backboardd not asking, not the race). Dry-run; Codex builds.
+- **Built by Codex (2026-11-11 04:19):** patch 0259 applied cleanly after 0256; local kernel build succeeded. Kernel:
+  `work/xnu-local-latest/dxb/build/xnu.obj/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet` (17,137,824 bytes,
+  SHA-256 `315fa909251e14af8de205615a20b911c6db526431f4a75a33cba92acd8242a2`). Fresh ADT:
+  `work/guacamole-0259-fb-off-black-again.adt` (`--highmem --guacamole`). Boot image:
+  `outputs/guacamole-0259-fb-off-black-again.img` (21,590,016 bytes, SHA-256
+  `2fd1042b05962881c4cb2ef59873e323de51791f7b735e5beb2f5f4e01c26e0e`), using the 0256 arguments with `sweettime`
+  refreshed and `sweetaudio=0` retained. Payload verified byte-for-byte; image not booted.
+- Status bar "No SIM" (nosim, userland/jb/nosim.m) parked: overrides need SBShowStatusBarOverridesForRecording,
+  which puts SpringBoard in demo mode (9:41); next idea is hooking SpringBoard's telephony (SIM not inserted).
+  `nosim off` + respring restores the normal status bar.
+
+# Active handoff — CommCenter + locationd both running (2026-11-11 03:50, Claude)
+
+- SUPERSEDES the IsVirtualDevice note below: system-wide IsVirtualDevice made locationd crash-loop (its modem-GPS
+  client CLQmiPdsManager -> libATCommandStudio +0x17164 releases the last ref of a never-resumed xpc connection to
+  com.apple.commcenter.atcs.xpc -> libxpc trap). Interposing xpc_connection_create_mach_service does not reach
+  cache-internal callers (userland/jb/atcsfix.c, left unused).
+- Now: IsVirtualDevice UNSET; CommCenter job -> /var/local/bin/sweet-cc (userland/jb/sweet-cc.c) which inserts
+  /usr/lib/libsweet-ccvirt.dylib (userland/jb/ccvirt.c): in CommCenter only, marks libTelephonyUtil's product
+  dispatch_once (0x1e1fd0d40, product 0x1e1fd0d60, block invoke check 0x1937c7d9c, 20H392 unslid) as done with
+  product 0 = "unknown product, no modem". CommCenter launchd job also lacks MachService com.apple.commcenter.atcs.xpc
+  (tools/sweet-root-tweaks.py --drop-mach-service), so locationd's lookup fails cleanly as before. locationd job back
+  to /usr/libexec/locationd. Result: both stable (pids unchanged, no CRASH).
+- tools/sweet-root-tweaks.py new: --drop-mach-service, --job-program. userland/jb/runas.c (run as another user).
+- Phone backups: /var/local/launchd.plist.pre-atcs, .pre-locd, .pre-cc (restore one + reboot to roll back).
+
+# (older) CommCenter via MobileGestalt IsVirtualDevice (2026-11-11 03:15, Claude)
+
+- CommCenter (iPhone build) threw `std::runtime_error: Unable to communicate with AppleBaseband driver`
+  (libTelephonyBasebandDynamic TelephonyBasebandCreateController: device "supported" -> waits for IOService
+  AppleBaseband -> throws). Seen by running it as _wireless with `userland/jb/runas.c` (new): it died only as
+  _wireless/launchd after the driver wait; as root I killed it first.
+- "Supported" comes from libTelephonyUtilDynamic (0x1937c7d9c): MGCopyAnswer("IsVirtualDevice") true -> "Detected
+  virtual device, so treating it as unknown Telephony product" (no modem); else product from MG HWModelStr (D22AP ->
+  Mav17). HasBaseband=false and BasebandChipset=none do NOT change it (tested).
+- Fix: `mgtool setbool IsVirtualDevice true` + CommCenter enabled (user/foreground and system) -> after reboot
+  CommCenter stable (same PID after 30 s). Other IsVirtualDevice readers in the shared cache: AssistantServices,
+  CoreSpeechFoundation, libAudioStatistics (+ telephony). Root-fs daemons not yet checked.
+  Rollback: `mgtool unset IsVirtualDevice`, `launchctl disable user/foreground/com.apple.CommCenter`, reboot.
+- Not "No SIM": that needs a running modem; this is the Wi-Fi-only (no modem) path.
+
 # Active handoff — iOS haptics reach the motor; AW8697 wedges -> REQUEST-J / 0258 (2026-11-11 02:35, Claude)
 
 - Full iOS haptic chain works: MG DeviceSupportsHaptics=true (new) + DeviceSupportsClosedLoopHaptics=true. VirtualAudio

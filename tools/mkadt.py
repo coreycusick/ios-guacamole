@@ -336,12 +336,19 @@ def build(seed=None, qemu=False, highmem=False):
     # IODeviceTree:/product/audio while it sets up its ports, and without it ("IORegistryEntryFromPath
     # IODeviceTree:/product/audio returned MACH_PORT_NULL") it publishes only the Null_Device / AP ports, no speaker
     # (apps: AQMEIO "Error -1 getting output port ID": no sound, YouTube in Safari fails, no Bluetooth audio).
-    # Deliberately NOT /product/haptics: MobileGestalt derives DeviceSupportsClosedLoopHaptics from it, and with
-    # that true mediaserverd sends every vibration to VibeSynth (no Taptic Engine here) instead of the "vibrator".
+    # /product/haptics of the D22AP tree ({closed-loop 1, supports-3rd-party-haptics 1}): MobileGestalt derives
+    # DeviceSupportsClosedLoopHaptics / DeviceSupportsHaptics from it when it (re)builds its cache (a new boot image
+    # drops answers set by hand with mgtool). Wanted since 2026-11-11: with both true mediaserverd's Haptic 2.0 engine
+    # plays every haptic on HakiosAudio's Actuator -> /dev/hakios-haptic (xnu 0255) and VirtualAudio creates
+    # VirtualAudioDevice_Actuator (it needs DeviceSupportsHaptics). Before HakiosAudio this node was left out (VibeSynth
+    # had no device then). mkadt option --no-product-haptics restores that.
     product_children = []
     audio_props = d22ap_product_child('audio') if GUACAMOLE else None
     if audio_props is not None:
         product_children.append(node('audio', [ph()] + audio_props))
+    haptics_props = d22ap_product_child('haptics') if GUACAMOLE and '--no-product-haptics' not in sys.argv else None
+    if haptics_props is not None:
+        product_children.append(node('haptics', [ph()] + haptics_props))
     product = [node('product', [ph()] + product_props, product_children)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the

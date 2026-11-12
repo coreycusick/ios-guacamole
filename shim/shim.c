@@ -13,6 +13,8 @@
 #include "ufs.h"
 #include "board.h"
 #include "spmi.h"
+#include "bootsel.h"
+#include "android.h"
 
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
@@ -387,6 +389,27 @@ void shim_main(uint64_t dtb)
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_str("BOARD", BOARD_NAME);
 	con_skip();
+#if defined(BOARD_GUACAMOLE)
+	/*
+	 * Boot selector (bootsel.c, android.c): Alert Slider at the top = Android from boot_a,
+	 * middle or bottom = iOS. If Android cannot be started the reason stays on screen
+	 * for 15 s, then iOS boots.
+	 */
+	stage = "bootsel";
+	uint32_t slider_raw = 0;
+	int slider = bootsel_slider(&slider_raw);
+	bootsel_show("SLIDER", slider);
+	if (slider == SLIDER_TOP) {
+		stage = "android";
+		con_str("BOOTSEL", "Android (boot_a)");
+		const char *afail = android_boot(dtb);
+		con_str("ANDROID", afail);
+		bootsel_report(dtb, slider, slider_raw);
+		delay_ms(15000);
+		stage = "loader";
+	}
+	con_str("BOOTSEL", "iOS");
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();

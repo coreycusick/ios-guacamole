@@ -1,0 +1,223 @@
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -70,6 +70,7 @@
+ #define R_RAMADDRL  0x41
+ #define R_RAMDATA   0x42
+ #define R_GLBSTATE  0x46
++#define R_DATDBG    0x39
+ #define SYS_RAMINIT    (1u << 5)
+ #define SYS_MODE_MASK  (3u << 2)     /* play mode: 0 RAM, 1 RTP, 2 CONT */
+ #define SYS_BOOST      (1u << 1)
+@@ -120,6 +121,9 @@
+ 	lck_mtx_t *lock;
+ } hp;
+ static int hap_sleep_chan;
++static volatile unsigned hi_taps, hi_loops, hi_capped, hi_wedged;
++static volatile uint32_t hi_last_peak, hi_last_wave;
++static int hap_configure_locked(bool full, bool click);
+ 
+ static uint32_t
+ hap_rd(vm_offset_t base, uint32_t off)
+@@ -423,19 +427,38 @@
+ hap_stop(void)
+ {
+ 	int err = hap_bits(R_GO, 1, 0);
++	bool idle = false;
+ 	for (unsigned i = 0; !err && i < 60; ++i) {
+ 		uint8_t st = 0;
+-		if (hap_read(R_GLBSTATE, &st) || (st & 0x0f) == 0) {
++		err = hap_read(R_GLBSTATE, &st);
++		if (err) {
++			break;
++		}
++		if ((st & 0x0f) == 0) {
++			idle = true;
+ 			break;
+ 		}
+ 		hap_wait(2);
+ 	}
+-	return err ? err : hap_standby();
++	if (err) {
++		return err;
++	}
++	if (!idle) {
++		uint8_t go = 0, ctrl = 0, state = 0;
++		(void)hap_read(R_GO, &go);
++		(void)hap_read(R_SYSCTRL, &ctrl);
++		(void)hap_read(R_GLBSTATE, &state);
++		++hi_wedged;
++		printf("SWEET HAPTIC: wedged (GO %u SYSCTRL %#x GLB %#x), set up again\n", go & 1, ctrl, state);
++		err = hap_configure_locked(true, false);
++		return err ? err : ETIMEDOUT;
++	}
++	return hap_standby();
+ }
+ 
+ /* aw8697_haptic_play_mode(RAM) without auto boost, then the sequence and GO */
+ static int
+-hap_play(uint8_t wave, uint8_t loops)
++hap_play_gain(uint8_t wave, uint8_t loops, uint8_t gain)
+ {
+ 	uint8_t junk = 0;
+ 	int err = hap_stop();
+@@ -451,10 +474,17 @@
+ 	err = err ? err : hap_write(R_WAVSEQ2, 0);
+ 	err = err ? err : hap_bits(R_WAVLOOP1, 0xf0, (uint8_t)(loops << 4));
+ 	err = err ? err : hap_write(R_MAINLOOP, 0);
++	err = err ? err : (gain ? hap_write(R_DATDBG, gain) : 0);
+ 	err = err ? err : hap_bits(R_GO, 1, 1);
+ 	return err;
+ }
+ 
++static int
++hap_play(uint8_t wave, uint8_t loops)
++{
++	return hap_play_gain(wave, loops, 0);
++}
++
+ /*
+  * 0251: what the chip did with a play, 5 and 25 ms after GO: SYSST (01) / SYSINT (02), bits (aw8697_reg.h)
+  * 7 BSTERR boost error, 6 OV, 5 UVL under-voltage, 4 FF_AE, 3 FF_AF, 2 OCD over-current, 1 OT over-temperature,
+@@ -521,9 +551,6 @@
+  * inspected and set up again without catching the boot log. Called without hp.lock held. 0 = configured.
+  */
+ static int
+-hap_configure_locked(bool full, bool click);
+-
+-static int
+ hap_configure(bool full, bool click)
+ {
+ 	lck_mtx_lock(hp.lock);                                   /* 0252: the reset pulse too (vibrator thread vs sysctl) */
+@@ -629,11 +656,9 @@
+ #define HI_SLOT_MS              100
+ #define HI_SLOTS                (HI_WINDOW_MS / HI_SLOT_MS + 1)
+ #define HI_GAIN_TOP             0x80    /* Android's strongest (aw8697_haptic_effect_strength) */
+-#define HI_TOLD                 24
+-#define R_DATDBG                0x39
+ static volatile uint64_t hi_heard_us, hi_quiet_us, hi_onset_us;
+ static volatile uint32_t hi_peak;
+-static unsigned hi_taps, hi_loops, hi_capped;
++static uint64_t hi_last_log_us;
+ 
+ static uint64_t
+ hi_now_us(void)
+@@ -694,7 +719,7 @@
+ static uint8_t
+ hi_gain(uint32_t peak)
+ {
+-	uint32_t top = HI_GAIN_TOP, low = top * 5 / 8, third = 32767 / 3;
++	uint32_t top = HI_GAIN_TOP, low = top / 4, third = 32767 / 3;
+ 	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
+ }
+ 
+@@ -702,15 +727,14 @@
+ static int
+ hi_start(uint8_t wave, bool forever, uint8_t gain)
+ {
+-	int err = hap_play(wave, forever ? 15 : 0);
+-	return err ? err : hap_write(R_DATDBG, gain);
++	return hap_play_gain(wave, forever ? 15 : 0, gain);
+ }
+ 
+ static void
+ hi_thread(__unused void *arg, __unused wait_result_t result)
+ {
+ 	enum { IDLE, TAP, LOOP, REST } state = IDLE;
+-	uint64_t since = 0, rest_until = 0, tap_onset = 0, followed = 0;
++	uint64_t since = 0, rest_until = 0, tap_onset = 0, followed = 0, oneshot_at = 0, health_at = 0;
+ 	uint8_t playing_gain = 0;
+ 	uint32_t driven[HI_SLOTS] = { 0 };
+ 	uint64_t duty_slot = hi_now_us() / (HI_SLOT_MS * 1000), duty_last = hi_now_us();
+@@ -744,7 +768,7 @@
+ 			lck_mtx_lock(hp.lock);
+ 			(void)hap_stop();
+ 			lck_mtx_unlock(hp.lock);
+-			hi_capped++;
++			++hi_capped;
+ 			rest_until = now + HI_MAX_MS * 1000ull;
+ 			state = REST;
+ 			printf("SWEET HAPTIC: ios: %llu ms of driving in %u ms: stopped, rests %u ms\n", window / 1000, HI_WINDOW_MS,
+@@ -755,6 +779,25 @@
+ 		switch (state) {
+ 		case IDLE:
+ 		case TAP:
++			if (state == IDLE && oneshot_at && now - oneshot_at >= 300000 && now - health_at >= 250000) {
++				uint8_t go = 0, glb = 0;
++				health_at = now;
++				lck_mtx_lock(hp.lock);
++				(void)hap_read(R_GO, &go);
++				(void)hap_read(R_GLBSTATE, &glb);
++				if ((go & 1) && (glb & 0x0f) == 7) {
++					uint8_t ctrl = 0;
++					(void)hap_read(R_SYSCTRL, &ctrl);
++					++hi_wedged;
++					printf("SWEET HAPTIC: wedged (GO %u SYSCTRL %#x GLB %#x), set up again\n", go & 1, ctrl, glb);
++					int rc = hap_configure_locked(true, false);
++					hp.ready = rc == 0;
++					hp.fresh = hp.ready;
++				} else {
++					oneshot_at = 0;
++				}
++				lck_mtx_unlock(hp.lock);
++			}
+ 			if (active && hi_onset_us != tap_onset && now - hi_onset_us >= HI_SETTLE_US) {
+ 				uint64_t began = hi_onset_us;
+ 				tap_onset = began;
+@@ -773,9 +816,13 @@
+ 				since = now;
+ 				oneshot_at = now;
+ 				health_at = now;
+-				if (++hi_taps + hi_loops <= HI_TOLD) {
++				++hi_taps;
++				hi_last_peak = peak;
++				hi_last_wave = wave;
++				if (now - hi_last_log_us >= 1000000) {
+ 					printf("SWEET HAPTIC: ios: tap %u: peak %u of 32768 -> waveform %u gain %#x\n", hi_taps, peak, wave,
+ 					    gain);
++					hi_last_log_us = now;
+ 				}
+ 				break;
+ 			}
+@@ -792,9 +839,13 @@
+ 					oneshot_at = 0;
+ 					playing_gain = gain ? gain : 1;
+ 					hi_peak = 0;
+-					if (hi_taps + ++hi_loops <= HI_TOLD) {
++					++hi_loops;
++					hi_last_peak = peak;
++					hi_last_wave = 10;
++					if (now - hi_last_log_us >= 1000000) {
+ 						printf("SWEET HAPTIC: ios: vibration %u: peak %u -> waveform 10 looped, gain %#x\n", hi_loops,
+ 						    peak, playing_gain);
++						hi_last_log_us = now;
+ 					}
+ 				}
+ 			} else if (!active && now - since > HI_TAP_US) {
+@@ -818,7 +869,7 @@
+ 			if (!active || now - since > HI_MAX_MS * 1000ull) {
+ 				bool cut = now - since > HI_MAX_MS * 1000ull;
+ 				if (cut) {
+-					hi_capped++;
++					++hi_capped;
+ 					rest_until = now + HI_MAX_MS * 1000ull;
+ 				}
+ 				lck_mtx_lock(hp.lock);
+@@ -1016,6 +1067,18 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_haptic, "I", "AW8697 haptics: N plays RAM waveform N, -ms buzzes, 0 stops, 200 sets the chip up again, 201 dumps");
+ 
++static int
++sysctl_sweet_haptic_ios SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char status[128];
++	snprintf(status, sizeof(status), "taps %u loops %u capped %u wedged %u last_peak %u last_wave %u",
++	    hi_taps, hi_loops, hi_capped, hi_wedged, hi_last_peak, hi_last_wave);
++	return sysctl_handle_string(oidp, status, sizeof(status), req);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_haptic_ios, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_haptic_ios, "A", "iOS AW8697 Actuator counters");
++
+ void
+ sweet_haptic_init(void)
+ {

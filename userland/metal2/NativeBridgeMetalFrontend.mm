@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <IOSurface/IOSurfaceRef.h>
+#include <IOKit/IOReturn.h>
 #include <os/lock.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -691,6 +692,7 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
 - (void)refuse:(NSString *)what;
+- (void)addCompletedHandler:(MTLCommandBufferHandler)block;
 @end
 @interface NBEncoder : NBObject {
 @public
@@ -750,6 +752,23 @@ static void sweetYCbCrRefresh(id<MTLTexture> t);   // 0257b
    NSStringFromClass([self class]),stage,(unsigned long)index,(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat,
    (unsigned long)texture.textureType,objc_getAssociatedObject(self,"pipe")?:@"-",objc_getAssociatedObject(self,"target")?:@"-");
  }
+ // 0260: every texture a compute kernel gets (the photo wallpaper: PhotosPosterProvider renders with compute only)
+ if(stage==0){
+  NSMutableDictionary *ct=objc_getAssociatedObject(self,"ctex");
+  if(!ct){ct=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"ctex",ct,OBJC_ASSOCIATION_RETAIN);}
+  NSMutableDictionary *co=objc_getAssociatedObject(self,"ctexobj");   // 0261: the textures themselves
+  if(!co){co=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,"ctexobj",co,OBJC_ASSOCIATION_RETAIN);}
+  if(texture)co[@(index)]=texture;else [co removeObjectForKey:@(index)];
+  if(texture){
+   IOSurfaceRef sf=[(NBTexture *)texture surface];
+   NSString *yc=objc_getAssociatedObject(texture,"ycbcr");
+   ct[@(index)]=[NSString stringWithFormat:@"t%lu=%lux%lu fmt %lu use %lu%@%@",(unsigned long)index,(unsigned long)texture.width,
+    (unsigned long)texture.height,(unsigned long)texture.pixelFormat,(unsigned long)texture.usage,
+    sf?[NSString stringWithFormat:@" surf %#x",IOSurfaceGetID(sf)]:@"",yc?[NSString stringWithFormat:@" (%@)",yc]:@""];
+  }else{
+   [ct removeObjectForKey:@(index)];
+  }
+ }
  // 0182: a full-screen surface bound for the fragment stage (another process's picture in backboardd's compositions)
  if(stage==2){
   NSString *key=[NSString stringWithFormat:@"ftex%lu",(unsigned long)index];
@@ -791,11 +810,42 @@ static void sweetYCbCrRefresh(id<MTLTexture> t);   // 0257b
 
 @interface NBComputeEncoder : NBEncoder
 @end
+// 0261: what a compute kernel's IOSurface textures hold, read by the CPU on an 8x8 grid: inputs when bound (at
+// dispatch), outputs (ShaderWrite) once the command buffer completed. RGBA8/BGRA8, RGBA16F, R16F, R8. Tracing only.
+static NSString *sweetSurfaceSample(id<MTLTexture> t) {
+ IOSurfaceRef sf=[(NBTexture *)t surface];
+ if(!sf)return @"no surface";
+ const MTLPixelFormat f=t.pixelFormat;
+ size_t bpp=(f==70||f==71||f==80||f==81)?4:(f==115)?8:(f==25)?2:(f==10)?1:0;
+ if(!bpp)return [NSString stringWithFormat:@"fmt %lu not sampled",(unsigned long)f];
+ if(IOSurfaceLock(sf,kIOSurfaceLockReadOnly,nullptr)!=kIOReturnSuccess)return @"lock failed";
+ size_t plane=0;   // plane views (R8 Y of a 4:2:0 surface) read plane 0
+ const uint8_t *base=(const uint8_t *)(IOSurfaceGetPlaneCount(sf)>1?IOSurfaceGetBaseAddressOfPlane(sf,plane):IOSurfaceGetBaseAddress(sf));
+ size_t row=IOSurfaceGetPlaneCount(sf)>1?IOSurfaceGetBytesPerRowOfPlane(sf,plane):IOSurfaceGetBytesPerRow(sf);
+ double sum[4]={0,0,0,0};unsigned black=0,n=0;
+ for(unsigned j=0;j<8 && base;j++)for(unsigned i=0;i<8;i++){
+  size_t x=t.width*(2*i+1)/16,y=t.height*(2*j+1)/16;
+  const uint8_t *px=base+y*row+x*bpp;float v[4]={0,0,0,1};
+  if(bpp==4){for(int c=0;c<4;c++)v[c]=px[c]/255.0f;}
+  else if(bpp==8){const __fp16 *h=(const __fp16 *)px;for(int c=0;c<4;c++)v[c]=(float)h[c];}
+  else if(bpp==2){v[0]=(float)*(const __fp16 *)px;}
+  else v[0]=px[0]/255.0f;
+  for(int c=0;c<4;c++)sum[c]+=v[c];
+  if(v[0]<0.03f && (bpp<4||(v[1]<0.03f && v[2]<0.03f)))black++;
+  n++;
+ }
+ IOSurfaceUnlock(sf,kIOSurfaceLockReadOnly,nullptr);
+ if(!n)return @"no base";
+ return [NSString stringWithFormat:@"black %u/64, mean %.2f %.2f %.2f %.2f",black,sum[0]/n,sum[1]/n,sum[2]/n,sum[3]/n];
+}
+static std::atomic<uint32_t> gComputeSamples{0};
+
 @implementation NBComputeEncoder
 - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
  [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
+ if(traceOn())objc_setAssociatedObject(self,"pipe",objc_getAssociatedObject(state,"desc"),OBJC_ASSOCIATION_RETAIN);   // 0260
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
 - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:0];}
@@ -815,6 +865,32 @@ static void sweetYCbCrRefresh(id<MTLTexture> t);   // 0257b
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
  [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
+ if(traceOn()){   // 0260: each distinct kernel + textures once (<= 80 a process)
+  static std::mutex lock;static NSMutableSet<NSString *> *seen;
+  NSDictionary *ct=objc_getAssociatedObject(self,"ctex");
+  NSArray *keys=[[ct allKeys] sortedArrayUsingSelector:@selector(compare:)];
+  NSMutableArray *tex=[NSMutableArray array];for(NSNumber *k in keys)[tex addObject:ct[k]];
+  NSString *line=[NSString stringWithFormat:@"%@ | %@",objc_getAssociatedObject(self,"pipe")?:@"(kernel ?)",[tex componentsJoinedByString:@", "]];
+  std::lock_guard<std::mutex> guard(lock);if(!seen)seen=[NSMutableSet set];
+  if(![seen containsObject:line] && seen.count<80){
+   [seen addObject:line];
+   NBLOG(@"native-metal: compute dispatch %llux%llux%llu %s %llux%llux%llu: %@",s[0],s[1],s[2],threads?"threads":"groups",g[0],g[1],g[2],line);
+   NSDictionary *co=objc_getAssociatedObject(self,"ctexobj");
+   NSString *kernel=objc_getAssociatedObject(self,"pipe")?:@"?";
+   for(NSNumber *k in [[co allKeys] sortedArrayUsingSelector:@selector(compare:)]){
+    id<MTLTexture> t=co[k];
+    if(![(NBTexture *)t surface] || gComputeSamples.fetch_add(1)>=120)continue;
+    if(t.usage & MTLTextureUsageShaderWrite){
+     NSString *head=[NSString stringWithFormat:@"compute output t%@ surf %#x %lux%lu fmt %lu (%@)",k,IOSurfaceGetID([(NBTexture *)t surface]),
+      (unsigned long)t.width,(unsigned long)t.height,(unsigned long)t.pixelFormat,[kernel substringToIndex:MIN((NSUInteger)60,kernel.length)]];
+     [self.commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>){NBLOG(@"native-metal: %@: %@",head,sweetSurfaceSample(t));}];
+    }else{
+     NBLOG(@"native-metal: compute input t%@ surf %#x %lux%lu fmt %lu: %@",k,IOSurfaceGetID([(NBTexture *)t surface]),(unsigned long)t.width,
+      (unsigned long)t.height,(unsigned long)t.pixelFormat,sweetSurfaceSample(t));
+    }
+   }
+  }
+ }
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
@@ -2371,7 +2447,9 @@ static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurf
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
- NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ if(traceOn())objc_setAssociatedObject(state,"desc",[NSString stringWithFormat:@"kernel %@",[(NBFunction *)function name]],OBJC_ASSOCIATION_RETAIN);   // 0260
+ return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
@@ -2384,6 +2462,8 @@ static id<MTLTexture> sweetYCbCrTexture(id device,MTLTextureDescriptor *d,IOSurf
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
  if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
+ if(traceOn())objc_setAssociatedObject(state,"desc",[NSString stringWithFormat:@"kernel %@ label=%@",
+  [d.computeFunction isKindOfClass:[NBFunction class]]?[(NBFunction *)d.computeFunction name]:@"?",d.label],OBJC_ASSOCIATION_RETAIN);   // 0260
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {

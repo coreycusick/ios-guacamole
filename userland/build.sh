@@ -30,6 +30,11 @@ build mgtool jb/mgtool.c -framework CoreFoundation
 build haptic jb/haptic.c
 build auprobe jb/auprobe.c -framework CoreFoundation
 build sweet-msd jb/sweet-msd.c
+build runas jb/runas.c
+build sweet-locd jb/sweet-locd.c
+build sweet-cc jb/sweet-cc.c
+build libsweet-ccvirt.dylib jb/ccvirt.c -dynamiclib -install_name /usr/lib/libsweet-ccvirt.dylib -Wl,-not_for_dyld_shared_cache
+build libsweet-atcsfix.dylib jb/atcsfix.c -dynamiclib -install_name /usr/lib/libsweet-atcsfix.dylib -Wl,-not_for_dyld_shared_cache
 build libsweet-autrace.dylib jb/autrace.c -dynamiclib -install_name /usr/lib/libsweet-autrace.dylib -Wl,-not_for_dyld_shared_cache -Wl,-U,_AudioObjectGetPropertyData,-U,_AudioObjectGetPropertyDataSize,-U,_AudioObjectSetPropertyData,-U,_AudioObjectHasProperty
 build vibtest jb/vibtest.c -framework AudioToolbox -framework IOKit -framework CoreFoundation
 build mgq jb/mgq.c -lMobileGestalt -framework CoreFoundation
@@ -68,10 +73,25 @@ fi
 # Wi-Fi: ios-flame's wland (userland/wland/README.md): modem + WLFW + WCN3990 radio from userland over /dev/pmem
 (cd wland && $CC -Wno-unused-parameter -o ../out/wland wland.c smem.c pmem.c glink.c link.c qmi.c rmtfs.c pdmapper.c \
 	tftp.c scm.c wlfw.c radio.c ipnet.c bridge.c) && codesign -f -s - out/wland && echo out/wland
+# Audio from upstream OtVaL228/ios-sweet ed7afa8 (docs/guacamole.md, Audio): ADSP boot + APR q6core (adspd) and the
+# two TFA9874 speaker amps on QUP SE4 (tfa), both over /dev/pmem. No sound yet: AFE/ASM/ADM do not answer.
+build adspd adsp/adspd.c adsp/edge.c wland/smem.c wland/qmi.c wland/pmem.c -Iwland -Wno-unused-parameter
+build tfa adsp/tfa.c wland/pmem.c -Iwland -Wno-unused-parameter
+# Alert Slider pins over /dev/pmem (upstream fc1dcb1; kernel side xnu 0264)
+build slider jb/slider.c
+# Files app / Safari downloads (upstream f0c75ce): fileproviderd with libsweet-fpfs (HFS taken as FPFS-eligible).
+# Phone: /var/local/bin/fpwrap, /var/local/lib/libsweet-fpfs.dylib, job com.apple.FileProvider -> fpwrap
+build fpwrap jb/fpwrap.c
+build libsweet-fpfs.dylib jb/fpfs.m -fobjc-arc -dynamiclib -install_name /var/local/lib/libsweet-fpfs.dylib \
+	-framework Foundation -Wl,-not_for_dyld_shared_cache
 # from ios-flame (userland/flame/README.md): LaunchServices registration, unified log stream
 build lsreg flame/lsreg.m -fobjc-arc -framework Foundation -framework MobileCoreServices
 codesign -f -s - --entitlements flame/lsreg-ents.plist out/lsreg
 build oslog flame/oslog.m -fobjc-arc -framework Foundation
+build sbprobe jb/sbprobe.m -fobjc-arc -framework Foundation
+build caprobe jb/caprobe.c -framework CoreFoundation -framework IOSurface
+build nosim jb/nosim.m -fobjc-arc -framework Foundation
+codesign -f -s - --entitlements jb/tsample.plist out/nosim
 codesign -f -s - --entitlements flame/oslog-ents.plist out/oslog
 build netsvc flame/netsvc.m -fobjc-arc -framework Foundation -framework SystemConfiguration
 codesign -f -s - --entitlements flame/netsvc-ents.plist out/netsvc

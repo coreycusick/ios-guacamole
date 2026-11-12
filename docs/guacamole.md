@@ -30,7 +30,10 @@ as coming from a device tree (DT) or Linux.
 | Display 90 Hz, brightness, Night Shift | works (0197-0199, sweet-displayd) |
 | Metal | SweetMetal2 (metal2vulkan + Turnip) for backboardd, WebKit and listed apps (see Metal) |
 | Bluetooth | works up to a selectable audio route: userland/bt/btbridge (WCN3998 H4 bridge, 3 Mbaud) + 0220-0223; launchd job com.sweet.btbridge |
-| Audio | in progress: silent IOAudio2Device stand-in (0226-0235), VirtualAudio builds 'vdef' on it; no speaker/receiver ports yet, no sound |
+| Dual boot (Alert Slider: top = Android, middle/bottom = iOS) | works tethered (shim bootsel/android loader); see docs/dualboot.md |
+| Alert Slider as the ring/silent switch | 0264 (from upstream 0158) + `mgtool setbool ringer-switch true`; see Alert Slider |
+| Files app (On My iPhone), Safari downloads | ported from upstream, untested here: 0265, 0266, fpwrap + libsweet-fpfs, job com.apple.FileProvider -> fpwrap; see Files app |
+| Audio | in progress: silent IOAudio2Device stand-in (0226-0235), VirtualAudio builds 'vdef' on it; no speaker/receiver ports yet, no sound. ADSP boot + TFA9874 amp init from userland (userland/adsp, from upstream), AFE does not answer yet |
 | CPU frequency, sensors, camera, cellular | not started |
 
 ## Workflow
@@ -54,7 +57,10 @@ as coming from a device tree (DT) or Linux.
   wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 sweetfb_hz=30
   sweetfb_noconsole=1` (+ `sweetgpu=N ufslogsecs=1` for GPU stages).
 - Log: TWRP (`fastboot boot twrp.img`), then `mkdir -p logs; tools/sweet-log-pull.sh logs/x.txt`.
-  Never format/wipe Data in TWRP: `userdata` holds the HFS+ iOS root.
+  LUN0 layout (2026-11-12, 4 KiB sectors): `userdata` sda19 1945992-18723207 (64 GiB, Android),
+  `ios26` sda21 18723208-30781831 (46 GiB, blank, for iOS 26 tests), `ios` sda20 30781832-61409274
+  (116.83 GiB, the iOS 16 HFS+ root, boot-arg `ufsroot=ios`; kernel log ring in its last 4 MiB + 4 KiB).
+  Previous GPT copies: dtb/sda-gpt-head.bin (LBA 0-5) and dtb/sda-gpt-tail.bin (LBA 61409275-61409279).
 - The shim is built with `BOARD=guacamole shim/build.sh`; `tools/mkguacboot.py`
   wraps it with the DTB and header fields of the phone's own stock `boot.img`.
 - Root image: `tools/mkiosroot.sh` on Linux with a stock kernel (needs the
@@ -302,6 +308,143 @@ First phone run (CI 40200983409): both ROOT/ files installed before
 SWEETBOX.done and relayed `vm_stat` (`SWEET RUN: [vm_stat] ...`). To update
 only the helper: a box with `ROOT/usr/libexec/sweet-autorun` and
 `sweetboxroot=1` again.
+
+## Alert Slider (from upstream OtVaL228/ios-sweet fc1dcb1, their 0158 = our 0264)
+
+0264 (bsd/dev/sweet_keys.c, keys thread, every 20 ms): TLMM gpio125 (top),
+gpio134 (middle), gpio27 (bottom), active low, one pin low per position.
+The bootloader leaves them pulled down (cfg 0x1, all read 0); the kernel
+writes GPIO_CFG = 0 once (no pull, Android's tri_state_key_active). Top and
+middle (OnePlus silent / vibrate) are silent, bottom rings; sweetslider=0
+off, 2 inverted. `userland/jb/slider` reads the pins over /dev/pmem.
+
+What iOS needs, from the disassembly: backboardd's BKButtonHIDEventProcessor
+sends only Telephony page 0xB usage **0x2E** to _processRingerSwitchEvent
+(0x2D is "Unknown page"), ringerState = the key's down value (0 "silent",
+1 "tone1"), so SweetHID sends down while at ring. SpringBoard's
+_ringerChanged: then does nothing unless SBUIHasHIDRingerSwitch(), which
+is MGGetBoolAnswer("ringer-switch"): false on this phone. Fixed in the
+MobileGestalt cache: `mgtool setbool ringer-switch true` (once; a rebuilt
+cache needs it again), then respring.
+
+
+## Audio: ADSP and speaker amps (from upstream OtVaL228/ios-sweet ed7afa8)
+
+From the Android dumps (live.dtb, dmesg, i2c.txt, vendor_b, modem_b):
+
+- Speakers: two NXP **TFA9874** smart amps (driver tfa98xx v6.5.3) on QUP
+  SE4 I2C (`i2c@890000`, Android i2c-0), 0x34 right (reset GPIO 37) and
+  0x35 left (reset GPIO 100). fsa4480 (USB-C audio switch) on the same bus
+  at 0x42. Haptics: aw8697 on i2c-2 at 0x5a.
+- Card `sm8150-tavil-snd-card` (WCD9340 on SLIMbus for headset/mics). The
+  speakers are fed by **QUAT_MI2S_RX** (AFE port 0x1006), 2 channels,
+  S24_LE (mixer_paths_tavil.xml "deep-buffer-playback quat_i2s",
+  audio_platform_info: speaker backend QUAT_MI2S_RX, ACDB id 15);
+  VI feedback off (QUAT_MI2S_RX_VI_FB_MUX = ZERO). Pins gpio137-142
+  (qua_mi2s). OnePlus commented out the WSA speaker path.
+- ADSP: APR over the GLINK channel `apr_audio_svc` on the lpass edge; audio
+  buffers through apps SMMU SID 0x1b21 (mask 0xf, msm-audio-ion). Firmware
+  modem_b `image/adsp.mdt` + b00-b14 (13 MB); `adspr.jsn` (root_pd) and
+  `adspua.jsn` (msm/adsp/audio_pd provides avs/audio) for pd-mapper.
+  Android also runs `adsprpcd audiopd` (fastrpc audio PD).
+- Precedent: the sm8150-mainline Linux tree (map220v/sm8150-mainline) has
+  APR q6core/q6afe/q6asm/q6adm on sm8150 without a protection-domain
+  property, and Xiaomi Pad 5 (nabu, SM8150) plays through
+  QUATERNARY_TDM_RX_0 to four CS35L41: same shape as ours.
+- iOS side: UniXNU-sheng (BSD-2-Clause-Patent) has a working
+  AudioServerPlugIn + kernel ring service (AudioReach DSP, SM8550); the DSP
+  half does not apply to our APR ADSP. ios-port-marble (SM7475) and
+  ios-sweet-grus (SM7150, APR, stopped at the audio PD) have no sound.
+- Extracted files (not in git): ../dumps/vendor-audio/ (mixer paths,
+  platform info, tfa98xx.cnt, acdbdata, adsp/).
+
+Bring-up from userland (userland/adsp, over /dev/pmem like wland):
+
+- `adspd` (firmware in /var/local/fw/adsp, lower-case names): PAS id 1,
+  region 0x8be00000 + 0x1e00000, cx vote >= 385, AOP load_state adsp,
+  SMP2P items 443 in / 429 out (IPC bit 10), GLINK on SMEM host 2 (IPC
+  bit 8). Works: ready after 100 ms; the ADSP opens IPCRTR, apr_audio_svc,
+  fastrpcglink-apps-dsp, apr_apps2, glink_ssr, LOOPBACK_CTL_LPASS; QRTR node
+  5 asks our pd-mapper for "avs/audio" (adspr/adspua.jsn table); APR q6core:
+  state 1 (ready), framework 2.9, services core 3, AFE 4 (0x260000), ASM 7,
+  ADM 8, 9-0xd. No audio PD needed for these.
+- `tfa`: GENI I2C on QUP wrapper 0 SE4 (GPIO51/52 mux 1; GCC vote 0x5200c
+  bits 6/7/14, RCG 0x17608 DFS level 0 = XO), the touch driver's FIFO engine.
+  Both amps answer: REV 0x0c74 (TFA9874, NXP "V1.14" settings), SYS_CTRL0
+  0x0001 (powered down). `tfa init` = NXP tfa_dev_start for a part without
+  CoolFlux (no CFE/SBSL/ACS fields): I2CR, key1/key2 unlock, the 0x0c74
+  register set, the container's device items (56 with the "speaker"
+  profile), MANSCONF=1, PWDN=0 -> MANSTATE 4, waiting for the I2S clock.
+- AFE plan: QUAT_MI2S_RX (0x1006) on SD1 (rx-lines 2, GPIO140; SCK 137,
+  WS 138), 48 kHz stereo 32-bit slots, Q6AFE clock QUAD_MI2S_IBIT (0x106)
+  3.072 MHz via AFE_SVC_CMD_SET_PARAM (0x100f3) / AFE_MODULE_CLOCK_SET,
+  AFE_PARAM_ID_I2S_CONFIG, DEVICE_START.
+- A silent ADSP restart kills Wi-Fi: after a plain PAS shutdown and a new
+  boot of the ADSP the modem went ERR-FATAL (wland.out) and the phone fell
+  off the network (the kernel kept running). Linux tells the other
+  processors over glink_ssr; we do not, so the ADSP boots once per phone
+  boot. `adspd serve` keeps it (commands through the FIFO
+  /var/local/adspd.cmd: afe on/off, status, pd PATH, open NAME RCID,
+  aprch, apr SVC OPCODE WORDS, quit, stop); `quit` saves the GLINK/QRTR
+  state (/var/local/adspd.state, .qrtr) so a new adspd adopts the running
+  edge instead of restarting the ADSP. `stop` is graceful (force-stop,
+  stop-ack, PAS shutdown).
+- The audio services do not answer: AFE (clock set, even DEVICE_STOP), ASM
+  and ADM never reply on apr_audio_svc (q6core does), though PDR (servreg
+  notifier, QRTR 0x42 at 5:3) reports msm/adsp/audio_pd UP. apr_apps2
+  (the ADSP's other APR channel, unused by Android's apr_tal_rpmsg) gives no
+  intents. Android runs `adsprpcd audiopd`: FastRPC INIT_CREATE_STATIC of
+  the audio PD with its remote heap; ios-sweet-grus stopped there too.
+  Next: that over fastrpcglink-apps-dsp.
+
+## Files app and Safari downloads (from upstream OtVaL228/ios-sweet f0c75ce, 1936ee5)
+
+Their 0161 = our 0265, their 0164 = our 0266.
+
+On My iPhone is FileProvider's LocalStorage domain on FPFS, which iOS 16
+builds for APFS; our root is HFS. Four walls, each seen in the unified log:
+
+1. fileproviderd keeps its FPFS library only on an eligible volume:
+   -[FPDVolume isEligibleForFPFS:] (FileProviderDaemon) takes a statfs and
+   wants f_fstypename "apfs" ("Non-eligible device /dev/ufsroot0: non-apfs"),
+   so every domain stayed "url:(null) state:disabled" and Files listed
+   nothing. userland/jb/fpfs.m (/var/local/lib/libsweet-fpfs.dylib) also
+   accepts a local writable HFS volume; userland/jb/fpwrap.c
+   (/var/local/bin/fpwrap) puts it in DYLD_INSERT_LIBRARIES and execs
+   fileproviderd. The com.apple.FileProvider job's Program in
+   /System/Library/xpc/launchd.plist is /var/local/bin/fpwrap (backup
+   launchd.plist.pre-fpwrap; /var/local/fpwrap.off turns the library off).
+2. The LocalStorage extension aborted: PlugInKit asks
+   sandbox_container_path_for_pid (Sandbox op 4) and throws on failure
+   ("plugin has invalid sandbox or container: error 2"). launchd spawns it
+   with Sandbox spawn attributes, profile "plugin", empty container; pkd
+   puts the data container in the launch overlay as HOME. Upstream fixed
+   this with their 0160 (container per pid from spawn attributes, else
+   HOME). Not ported: our 0201/0202 already answer op 4 (spawn attributes
+   and containers by signing identity from sweet-containers). If the
+   LocalStorage extension still dies with "invalid sandbox or container",
+   port their HOME fallback (copy in research/upstream/upstream-0160-sandbox-containers.patch).
+3. FPFS marks a domain's storage as a sync root with APFS fsctls
+   ("can't obtain VFSItem ... [25: Inappropriate ioctl]"). 0265 emulates
+   _IOW/_IOR('J', 72) (set/get, xattr com.apple.sweet.syncroot) and
+   _IOR('J', 74) (sync root id above an item) for HFS. The storage made
+   before 0265 needed the mark once by hand (`xattr -w
+   com.apple.sweet.syncroot 1 ".../File Provider Storage"`).
+4. Directories could not be found by file id (a new folder vanished):
+   fpfs_fgethandle asks fpfs_pkg_dirstat, _IOWR('J', 32, 40 bytes), and
+   accepts only ENOTSUP as "not supported". 0265 answers ENOTSUP for that
+   one fsctl on HFS. Not for every 'J' fsctl: launchd queries the root with
+   one and panics the boot on ENOTSUP ("failed to query root device
+   status: 45"); it wants ENOTTY.
+
+0265 also logs, once per command, file system ioctls that end in ENOTTY or
+ENOTSUP from the FileProvider processes ("SWEET IOCTL: ...").
+
+Safari downloads (0266): LocalStorageFileProvider issues the APFS-private
+_IOW('J', 2, u64) on the placeholder it creates in Downloads; ENOTTY on
+HFS failed the import ("failed to import placeholder", downloads stuck "in
+progress"). 0266 takes it as done for regular files on HFS; downloads land
+in Files. Needs everything above (Files working) first.
 
 ## Next
 

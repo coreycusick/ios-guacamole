@@ -135,11 +135,16 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
-static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
+static uint32_t read_lun(uint8_t lun, uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi(lun, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+}
+
+static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
+{
+	return read_lun(0, lba, count, buf);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -263,4 +268,103 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+}
+
+/* ---- boot selector: read-only access to any LUN (no SCSI WRITE here either) ---- */
+
+static int ufs_taken;
+
+/* Take over the transfer request list as test_ufs does, quietly. 0 = ready. */
+int ufs_open(void)
+{
+	if (ufs_taken)
+		return 0;
+	uint32_t hcs = ufs_rd(REG_HCS);
+	if (!(ufs_rd(REG_HCE) & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY) || ufs_rd(REG_UTRLDBR))
+		return 1;
+	ufs_wr(REG_UTRLRSR, 0);
+	uintptr_t list = (uintptr_t)utrl;
+	ufs_wr(REG_UTRLBA, (uint32_t)list);
+	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+	ufs_wr(REG_UTRLRSR, 1);
+	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+	    !(ufs_rd(REG_UTRLRSR) & 1))
+		return 2;
+	ufs_taken = 1;
+	return 0;
+}
+
+/* Clear a pending unit attention on lun (TEST UNIT READY, a few tries). */
+static void ufs_tur(uint8_t lun)
+{
+	static const uint8_t tur[6] = { 0x00 };
+	uint32_t ocs, st;
+	for (int i = 0; i < 3; i++)
+		if (!scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st))
+			return;
+}
+
+/* count blocks from lba of lun into buf (dword aligned), 64 blocks (256 KiB, one PRDT entry) per command. */
+uint32_t ufs_read(uint8_t lun, uint32_t lba, uint32_t count, void *buf)
+{
+	uint8_t *p = buf;
+	while (count) {
+		uint32_t n = count > 64 ? 64 : count, rc = read_lun(lun, lba, n, p);
+		if (rc)
+			return rc;
+		lba += n;
+		count -= n;
+		p += (uintptr_t)n * BLOCK;
+	}
+	return 0;
+}
+
+static int name_is(const uint8_t *e, const char *want)
+{
+	for (int c = 0; c < 36; c++) {
+		uint8_t lo = e[56 + 2 * c], hi = e[57 + 2 * c];
+		if (hi || lo != (uint8_t)want[c])
+			return 0;
+		if (!lo)
+			return 1;
+	}
+	return 0;
+}
+
+/* Find a GPT partition by name on LUNs 0-5. Returns 0 and its LUN and LBA range. */
+int ufs_find(const char *name, uint8_t *lun_out, uint32_t *first_out, uint32_t *last_out)
+{
+	return ufs_find_guid(name, lun_out, first_out, last_out, 0);
+}
+
+int ufs_find_guid(const char *name, uint8_t *lun_out, uint32_t *first_out, uint32_t *last_out, uint8_t *guid)
+{
+	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
+	for (uint8_t lun = 0; lun < 6; lun++) {
+		ufs_tur(lun);
+		if (read_lun(lun, 1, 1, data))
+			continue;
+		const uint8_t *g = data;
+		if (g[0] != 'E' || g[1] != 'F' || g[2] != 'I' || g[3] != ' ')
+			continue;
+		uint32_t nent = g[80] | g[81] << 8 | g[82] << 16, esz = g[84] | g[85] << 8;
+		uint32_t elba = g[72] | g[73] << 8 | g[74] << 16 | (uint32_t)g[75] << 24;
+		if (esz != 128 || nent > 128 || !nent)
+			continue;
+		if (read_lun(lun, elba, (nent * 128 + BLOCK - 1) / BLOCK, ents))
+			continue;
+		for (uint32_t i = 0; i < nent; i++) {
+			const uint8_t *e = ents + i * 128;
+			if (le64(e + 32) && name_is(e, name)) {
+				*lun_out = lun;
+				*first_out = (uint32_t)le64(e + 32);
+				*last_out = (uint32_t)le64(e + 40);
+				if (guid)
+					for (int k = 0; k < 16; k++)
+						guid[k] = e[16 + k];	/* unique partition GUID, on-disk (mixed-endian) order */
+				return 0;
+			}
+		}
+	}
+	return 1;
 }

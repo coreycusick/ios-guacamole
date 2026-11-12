@@ -268,7 +268,48 @@ def job_env(label, key, value, src, dst):
     save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
 
 
+def drop_mach_service(label, service, src, dst):
+    """--drop-mach-service LABEL SERVICE IN OUT: remove one MachServices name from a job, so lookups of it fail
+    (as when the job is not loaded) while the job itself still runs. E.g. CommCenter without a modem
+    (MobileGestalt IsVirtualDevice) keeps com.apple.commcenter.atcs.xpc registered but does not serve it, and
+    locationd's ATCommandStudio client then over-releases its connection and crashes; with the name gone it
+    fails cleanly, as before."""
+    st = os.stat(src)
+    plist = load(src)
+    found = [j for j in plist['LaunchDaemons'].values() if j.get('Label') == label]
+    if not found:
+        sys.exit(f'{label}: not in {src}')
+    for j in found:
+        if j.get('MachServices', {}).pop(service, None) is None:
+            print(f'launchd.plist: {label}: no MachService {service} (unchanged)')
+        else:
+            print(f'launchd.plist: {label}: MachService {service} removed')
+    save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
+def job_program(label, program, src, dst):
+    """--job-program LABEL PATH IN OUT: run a job through a wrapper (e.g. /var/local/bin/sweet-locd, which adds a
+    DYLD_INSERT_LIBRARIES launchd would strip and execs the real daemon); the job's other arguments are kept."""
+    st = os.stat(src)
+    plist = load(src)
+    found = [j for j in plist['LaunchDaemons'].values() if j.get('Label') == label]
+    if not found:
+        sys.exit(f'{label}: not in {src}')
+    for j in found:
+        args = list(j.get('ProgramArguments') or [j.get('Program')])
+        j.pop('Program', None)
+        j['ProgramArguments'] = [program] + args[1:]
+        print(f'launchd.plist: {label} ProgramArguments = {j["ProgramArguments"]} (was {args})')
+    save(dst, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
 def main():
+    if len(sys.argv) == 6 and sys.argv[1] == '--job-program':
+        job_program(*sys.argv[2:6])
+        return
+    if len(sys.argv) == 6 and sys.argv[1] == '--drop-mach-service':
+        drop_mach_service(*sys.argv[2:6])
+        return
     if len(sys.argv) == 7 and sys.argv[1] == '--job-env':
         job_env(*sys.argv[2:7])
         return

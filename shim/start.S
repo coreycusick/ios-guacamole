@@ -126,3 +126,32 @@ exc_common:
 	add	sp, sp, #(30 * 8)
 	ldp	x29, x30, [sp], #16
 	eret
+
+/*
+ * Boot selector: Linux chain-load trampoline. Copied out of the shim (the
+ * kernel goes where the shim runs) and entered with the MMU and caches off:
+ *   x0 = destination, x1 = source, x2 = length (multiple of 8), x3 = DTB.
+ * Copies the kernel Image, cleans the I-side, and enters it as the arm64
+ * boot protocol wants: x0 = DTB, x1-x3 = 0.
+ */
+	.balign	8
+	.globl	linux_tramp
+	.globl	linux_tramp_end
+linux_tramp:
+	mov	x4, x0
+	cbz	x2, 2f
+1:	ldr	x5, [x1], #8
+	str	x5, [x0], #8
+	subs	x2, x2, #8
+	b.ne	1b
+2:	dsb	sy
+	ic	iallu
+	dsb	sy
+	isb
+	mov	x0, x3
+	mov	x1, xzr
+	mov	x2, xzr
+	mov	x3, xzr
+	br	x4
+	.balign	8
+linux_tramp_end:
