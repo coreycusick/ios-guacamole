@@ -1,0 +1,129 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -106,11 +106,16 @@
+  * callers it is spent under; return addresses as found, i.e. just after the call). A thread in a system call shows
+  * the call's stub as its leaf, so kernel time is charged to the user code that asked for it.
+  * tools/sweet-profile.py turns the report into function names. One profile at a time.
++ *
++ * 2026-11-27: also the most common call chains ("call N LEAF RET1 .. RET5": the leaf and the first five frames
++ * above it), so a syscall stub's time (clock traps, mach_msg, madvise) shows who asked for it.
+  */
+ #define PROF_SLOTS      8192u           /* per table, power of two */
+ #define PROF_THREADS    64
+ #define PROF_DEPTH      24
+ #define PROF_TOP        300
++#define PROF_CHAIN      6               /* call chain: leaf + 5 frames */
++#define PROF_CHAIN_TOP  200
+ #define PROF_REPORT     (128u << 10)
+ #define PROF_CACHE_LO   0x180000000ull  /* shared cache range before the slide (tools/sweet-crash.py) */
+ #define PROF_CACHE_HI   0x300000000ull
+@@ -125,6 +130,11 @@
+ 	uint32_t n, pad;
+ };
+ 
++struct prof_chain {
++	uint64_t a[PROF_CHAIN];
++	uint32_t n, pad;
++};
++
+ static int prof_running;                /* 1 while a profile thread runs */
+ static char *prof_report;               /* the last report (PROF_REPORT bytes), kept until the next profile */
+ static char prof_name[32];
+@@ -151,6 +161,54 @@
+ 	return false;
+ }
+ 
++static void
++prof_add_chain(struct prof_chain *t, const uint64_t *f, uint32_t *dropped)
++{
++	uint64_t k[PROF_CHAIN], h64 = 0;
++	for (int i = 0; i < PROF_CHAIN; i++) {
++		k[i] = (i == 0 || k[i - 1]) ? (f[i] & PROF_VA_MASK) : 0;
++		h64 = (h64 ^ k[i]) * 0x9E3779B97F4A7C15ull;
++	}
++	uint32_t h = (uint32_t)(h64 >> 51);
++	for (uint32_t i = 0; i < PROF_SLOTS; i++) {
++		struct prof_chain *s = &t[(h + i) & (PROF_SLOTS - 1)];
++		if (s->n && memcmp(s->a, k, sizeof(k)) == 0) {
++			s->n++;
++			return;
++		}
++		if (s->n == 0) {
++			memcpy(s->a, k, sizeof(k));
++			s->n = 1;
++			return;
++		}
++	}
++	(*dropped)++;
++}
++
++static int
++prof_top_chains(struct prof_chain *t, char *s, int cap)
++{
++	int n = 0;
++	for (int k = 0; k < PROF_CHAIN_TOP && n < cap - 160; k++) {
++		struct prof_chain *best = NULL;
++		for (uint32_t i = 0; i < PROF_SLOTS; i++) {
++			if (t[i].n && (best == NULL || t[i].n > best->n)) {
++				best = &t[i];
++			}
++		}
++		if (best == NULL) {
++			break;
++		}
++		n += snprintf(s + n, cap - n, "call %u", best->n);
++		for (int i = 0; i < PROF_CHAIN && n < cap - 24; i++) {
++			n += snprintf(s + n, cap - n, " 0x%llx", best->a[i]);
++		}
++		n += snprintf(s + n, cap - n, "\n");
++		best->n = 0;
++	}
++	return n;
++}
++
+ /* The PROF_TOP biggest counts of t as "tag COUNT ADDR" lines (empties t). */
+ static int
+ prof_top(struct prof_slot *t, const char *tag, char *s, int cap)
+@@ -187,13 +245,15 @@
+ 	task_t task = (task_t)arg;
+ 	size_t table = PROF_SLOTS * sizeof(struct prof_slot), stacks = PROF_THREADS * PROF_DEPTH * sizeof(uint64_t);
+ 	struct prof_slot *leaf = kalloc_data(table, Z_WAITOK | Z_ZERO), *incl = kalloc_data(table, Z_WAITOK | Z_ZERO);
++	size_t ctable = PROF_SLOTS * sizeof(struct prof_chain);
++	struct prof_chain *chains = kalloc_data(ctable, Z_WAITOK | Z_ZERO);
+ 	uint64_t *st = kalloc_data(stacks, Z_WAITOK | Z_ZERO);
+ 	char *r = kalloc_data(PROF_REPORT, Z_WAITOK | Z_ZERO);
+ 	uint64_t ticks = 0, samples = 0, begin = mach_absolute_time(), end, now, ns;
+ 	uint32_t dropped = 0, maxrun = 0;
+ 
+ 	clock_interval_to_deadline((uint32_t)prof_secs * 1000u, NSEC_PER_MSEC, &end);
+-	if (leaf && incl && st && r) {
++	if (leaf && incl && chains && st && r) {
+ 		while ((now = mach_absolute_time()) < end) {
+ 			int nt = sweet_profile_stacks(task, st, PROF_THREADS, PROF_DEPTH);
+ 			ticks++;
+@@ -208,6 +268,7 @@
+ 					continue;
+ 				}
+ 				prof_add(leaf, f[0] & PROF_VA_MASK, &dropped);
++				prof_add_chain(chains, f, &dropped);
+ 				for (int i = 0; i < PROF_DEPTH && f[i] != 0; i++) {
+ 					uint64_t a = f[i] & PROF_VA_MASK;
+ 					bool dup = false;
+@@ -231,6 +292,7 @@
+ 		    (int)PROF_REPORT / 4);
+ 		n += prof_top(leaf, "leaf", r + n, (int)PROF_REPORT - n);
+ 		n += prof_top(incl, "incl", r + n, (int)PROF_REPORT - n);
++		n += prof_top_chains(chains, r + n, (int)PROF_REPORT - n);
+ 		printf("SWEET PROFILE: %s[%d] done: %llu ticks, %llu samples, report %d bytes (sysctl -n kern.sweet_profile)\n",
+ 		    prof_name, prof_pid, ticks, samples, n);
+ 	} else {
+@@ -245,6 +307,9 @@
+ 	if (incl) {
+ 		kfree_data(incl, table);
+ 	}
++	if (chains) {
++		kfree_data(chains, ctable);
++	}
+ 	if (st) {
+ 		kfree_data(st, stacks);
+ 	}

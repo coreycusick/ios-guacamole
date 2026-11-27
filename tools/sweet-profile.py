@@ -2,7 +2,7 @@
 """Turn a kern.sweet_profile report (bsd/dev/sweet_sample.c) into function names, summed per function.
 
   ssh PHONE 'sysctl kern.sweet_profile="backboardd 10"; sleep 12; sysctl -n kern.sweet_profile' > outputs/prof.txt
-  python3 tools/sweet-profile.py outputs/prof.txt [--cache CACHE] [--bin NAME=PATH ...] [--top N]
+  python3 tools/sweet-profile.py outputs/prof.txt [--cache CACHE] [--bin NAME=PATH ...] [--top N] [--chains N]
 
 CACHE: the iOS 27.2 dyld_shared_cache_arm64e (default research/ios27.2/dsc-system/dyld_shared_cache_arm64e);
 addresses in it are unslid and resolved with `ipsw dyld a2s` (cached in outputs/.a2s-cache.json between runs).
@@ -21,7 +21,7 @@ REPO = os.path.dirname(HERE)
 
 
 def parse(path):
-    rep = {'slide': 0, 'mh': 0, 'imgs': [], 'leaf': [], 'incl': [], 'head': ''}
+    rep = {'slide': 0, 'mh': 0, 'imgs': [], 'leaf': [], 'incl': [], 'call': [], 'head': ''}
     for line in open(path, errors='replace'):
         line = line.rstrip('\n')
         if line.startswith('profile '):
@@ -35,6 +35,9 @@ def parse(path):
         m = re.match(r'(leaf|incl) (\d+) (0x[0-9a-f]+)', line)
         if m:
             rep[m.group(1)].append((int(m.group(2)), int(m.group(3), 16)))
+        m = re.match(r'call (\d+)((?: 0x[0-9a-f]+)+)', line)
+        if m:
+            rep['call'].append((int(m.group(1)), [int(x, 16) for x in m.group(2).split()]))
     rep['imgs'].sort()
     return rep
 
@@ -112,6 +115,29 @@ def table(title, rows, res, top, is_leaf, total):
         print(f'{100.0 * n / total:6.1f}%  {n:7d}  {f}   [{examples[f]}]')
 
 
+def chains(rows, res, top, total, depth):
+    """Call chains (kernel sweet_sample.c "call" lines), summed by function names: leaf <- caller <- ..."""
+    if not rows:
+        return
+    look = sorted({a if i == 0 else a - 1 for _, ch in rows for i, a in enumerate(ch[:depth]) if a})
+    res.prefetch_atos(look)
+    sums, done = collections.Counter(), 0
+    for n, ch in rows:
+        names = []
+        for i, a in enumerate(ch[:depth]):
+            if not a:
+                break
+            names.append(strip_offset(res.name(a if i == 0 else a - 1)))
+        dedup = [x for j, x in enumerate(names) if j == 0 or x != names[j - 1]]
+        sums[' <- '.join(dedup)] += n
+        done += 1
+        sys.stderr.write(f'\rcall chains: {done}/{len(rows)}')
+    sys.stderr.write('\n')
+    print(f'\n== call chains (leaf <- callers, {depth} frames; share of all thread samples)')
+    for c, n in sums.most_common(top):
+        print(f'{100.0 * n / total:6.1f}%  {n:7d}  {c}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('report')
@@ -119,6 +145,8 @@ def main():
     ap.add_argument('--bin', action='append', default=[], help='NAME=PATH: local copy of an image outside the cache')
     ap.add_argument('--top', type=int, default=40)
     ap.add_argument('--limit', type=int, default=150, help='resolve only the N biggest addresses of each list')
+    ap.add_argument('--chains', type=int, default=80, help='resolve the N biggest call chains (0: none)')
+    ap.add_argument('--chain-depth', type=int, default=6, help='frames of each chain to name (1-6)')
     a = ap.parse_args()
     rep = parse(a.report)
     if not rep['leaf']:
@@ -133,6 +161,8 @@ def main():
     try:
         table('self time (leaf)', rep['leaf'][:a.limit], res, a.top, True, total)
         table('inclusive (function and its callees)', rep['incl'][:a.limit], res, a.top, False, total)
+        if a.chains:
+            chains(rep['call'][:a.chains], res, a.top, total, max(1, min(6, a.chain_depth)))
     finally:
         res.save()
 
