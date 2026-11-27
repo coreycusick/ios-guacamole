@@ -12,6 +12,8 @@
  *                               AppleOLYHAL service this phone does not have: "Manufacturer is -1")
  *   mgtool unset NAME           remove an answer (MobileGestalt computes it again)
  *
+ * NAME may be @KEY for a key given already obfuscated (its name is not known): powerd's battery
+ * authentication policy asks @D6/BMDrlb8V3WSiqL8gL+w (2026-11-26).
  * NAME may be GROUP/ENTRY for an entry of an answer that is a dictionary: ArtworkTraits/ArtworkDeviceSubType
  * is the device subtype SpringBoard lays its screen out by (2556 = iPhone 14 Pro: Dynamic Island). A
  * dictionary answer is printed entry by entry.
@@ -35,6 +37,9 @@ obfuscated(const char *name)
 {
 	char in[256];
 	unsigned char md[CC_MD5_DIGEST_LENGTH];
+	if (name[0] == '@') {           /* 2026-11-26: @KEY = an already obfuscated key (name unknown) */
+		return CFStringCreateWithCString(NULL, name + 1, kCFStringEncodingASCII);
+	}
 	snprintf(in, sizeof(in), "MGCopyAnswer%s", name);
 	CC_MD5(in, (CC_LONG)strlen(in), md);
 	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -94,7 +99,7 @@ print_value(const char *name, CFTypeRef v)
 static CFMutableDictionaryRef
 container_of(CFMutableDictionaryRef extra, const char *name, CFStringRef *key, bool make)
 {
-	const char *slash = strchr(name, '/');
+	const char *slash = name[0] == '@' ? NULL : strchr(name, '/');   /* a raw @KEY may contain '/' */
 	if (slash == NULL) {
 		*key = obfuscated(name);
 		return extra;

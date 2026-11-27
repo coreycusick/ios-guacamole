@@ -6,6 +6,7 @@
 #   WifiVendor USI                 BlueTool picks the Bluetooth chip's boot script by it (else no Bluetooth)
 #   HasBaseband, cellular-data, telephony, CellularTelephonyCapability   cellular stack, Cellular settings row
 #   DeviceSupportsHaptics, DeviceSupportsClosedLoopHaptics, ringer-switch
+#   (and every boot: perfstate 1, powerlogd's perfManagementState for Battery Health)
 #   ArtworkTraits/ArtworkDeviceSubType 1792, ArtworkDeviceScaleFactor 2   the @2x (828x1792) layout, no rdar bar
 # iOS has no sleep/touch/date binaries: zsh modules instead (2026-11-20).
 zmodload zsh/zselect zsh/datetime
@@ -14,6 +15,11 @@ pause() { zselect -t $(( $1 * 100 )); }
 cache=/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist
 mark=/var/local/mgfix.done
 mg=/var/local/bin/mgtool
+# 2026-11-27: Battery Health needs powerlogd's perfManagementState (PerfPowerServices is not in this root):
+# 1 = normal peak performance (this port never throttles for battery age). Every boot; cheap.
+if [ -x /var/local/bin/perfstate ]; then
+	/var/local/bin/perfstate 1 && { /var/jb/usr/bin/killall cfprefsd 2>/dev/null || killall cfprefsd; }   # exit 3: already 1
+fi
 for i in {1..120}; do [ -f $cache ] && break; pause 1; done
 [ -f $cache ] || { echo "$(now) no MobileGestalt cache after 120 s"; exit 0; }
 if [ -f $mark ] && [ ! $cache -nt $mark ]; then echo "$(now) cache unchanged, nothing to do"; exit 0; fi

@@ -27,6 +27,7 @@ codesign -f -s - --entitlements sysapps/entitlements.plist out/sweet-sysapps
 build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
 # MobileGestalt answer cache editor (metal/gamekit for AB2; ArtworkDeviceSubType for the Dynamic Island); install to /usr/local/bin
 build mgtool jb/mgtool.c -framework CoreFoundation
+build perfstate jb/perfstate.c -framework CoreFoundation
 build urlprops jb/urlprops.m -fobjc-arc -framework Foundation
 build haptic jb/haptic.c
 build auprobe jb/auprobe.c -framework CoreFoundation

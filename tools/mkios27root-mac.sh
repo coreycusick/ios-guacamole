@@ -86,6 +86,19 @@ sudo rm -f /tmp/ios27-launchd.new
 sudo python3 "$TOOLS/patch-bluetool27-profile.py" "$R/usr/sbin/BlueTool" /tmp/ios27-BlueTool.new
 sudo sh -c 'cat /tmp/ios27-BlueTool.new > "$1"' _ "$R/usr/sbin/BlueTool"	# keeps owner, mode, hard links
 sudo rm -f /tmp/ios27-BlueTool.new
+# powerd: this phone has no Apple battery authentication; take powerd's own "not supported" path (legacy devices
+# without auth) instead of waiting forever for an auth service, which left Settings' Battery Health spinning.
+# One branch (tools/patch-powerd-battauth.py); page hashes refreshed, signature and entitlements stay. 2026-11-26.
+PD="$R/System/Library/CoreServices/powerd.bundle/powerd"
+sudo python3 "$TOOLS/patch-powerd-battauth.py" "$PD" /tmp/ios27-powerd.new
+sudo sh -c 'cat /tmp/ios27-powerd.new > "$1"' _ "$PD"	# keeps owner, mode, hard links
+sudo rm -f /tmp/ios27-powerd.new
+# Settings' Battery pane asks the same battery-auth question and shows an auth spinner forever; same treatment
+# (tools/patch-bui-battauth.py: its two MGGetBoolAnswer calls answer false). 2026-11-27.
+BUI="$R/System/Library/PreferenceBundles/BatteryUsageUI.bundle/BatteryUsageUI"
+sudo python3 "$TOOLS/patch-bui-battauth.py" "$BUI" /tmp/ios27-BUI.new
+sudo sh -c 'cat /tmp/ios27-BUI.new > "$1"' _ "$BUI"	# keeps owner, mode, hard links
+sudo rm -f /tmp/ios27-BUI.new
 # launchd.plist: no FairPlay here; com.apple.fairplayd.H2 exits -42306 and KeepAlive restarts it forever.
 # 2026-11-19: com.apple.cameracaptured goes too: the synthetic camera kept restarting it (about 400 MB of GPU pool,
 # then a jetsam kill, every few seconds), which resprung SpringBoard when leaving a game. backboardd gets
@@ -306,7 +319,7 @@ fi
 # Tools and helper jobs: spinwatch (restarts locationd when it spins a core), bootlog (first 4 min of oslog per boot),
 # tsample / ptop / oslog for debugging.
 sudo install -d -m 0755 "$R/private/var/local/bin"
-for t in spinwatch tsample ptop oslog mgtool; do
+for t in spinwatch tsample ptop oslog mgtool perfstate; do
 	[ -f "$U/$t" ] && sudo install -m 0755 "$U/$t" "$R/private/var/local/bin/$t" && echo "tool: $t"
 done
 [ -f "$U/spinwatch" ] && jobs+=(spinwatch)

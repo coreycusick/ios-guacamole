@@ -1,0 +1,55 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -54,6 +54,8 @@
+ 	int fLastMode, fKind;           /* sweetbattery: 1 PM6150, 2 PM8150B */
+ 	unsigned fDesign, fPolls;       /* design capacity (mAh); polls so far */
+ 	unsigned fTemperature;          /* centidegrees C */
++	int fLastUsbIn;                 /* 2026-11-26: USBIN present at the last 1 s check (-1 not read yet) */
++	unsigned fTicks;                /* 1 s checks since the last full poll */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -107,6 +109,8 @@
+ 	fDesign = 5020;
+ 	fPolls = 0;
+ 	fTemperature = 2500;
++	fLastUsbIn = -1;
++	fTicks = 0;
+ 	return true;
+ }
+ 
+@@ -407,8 +411,23 @@
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+-		sender->setTimeoutMS(30000);
++		/*
++		 * 2026-11-26: a charger is seen within a second. Each second only the USBIN present bit (SMB5 USBIN
++		 * 0x1310 bit 4, the same `external` the full poll uses) is read; when it changes the full poll runs at
++		 * once and again 3 s later (charger type detection and the charge state settle by then). Otherwise the
++		 * full poll every 30 s as before.
++		 */
++		uint8_t usb = 0;
++		int in = sweet_spmi_read(self->fKind == 2 ? 2 : 0, 0x1310, &usb) ? self->fLastUsbIn : ((usb & 0x10u) != 0);
++		if (in != self->fLastUsbIn) {
++			self->fLastUsbIn = in;
++			self->fTicks = 27;              /* the follow-up full poll in 3 s */
++			self->poll();
++		} else if (++self->fTicks >= 30) {
++			self->fTicks = 0;
++			self->poll();
++		}
++		sender->setTimeoutMS(1000);
+ 	}
+ }
+ 
+@@ -453,7 +472,7 @@
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(1000);    /* 2026-11-26: the 1 s USBIN check (timerFired) */
+ 		} else {
+ 			fReal = false;
+ 			poll();
