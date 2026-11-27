@@ -28,6 +28,8 @@ build sweet-fs fsutil/sweet-fs.c -framework CoreFoundation
 # MobileGestalt answer cache editor (metal/gamekit for AB2; ArtworkDeviceSubType for the Dynamic Island); install to /usr/local/bin
 build mgtool jb/mgtool.c -framework CoreFoundation
 build perfstate jb/perfstate.c -framework CoreFoundation
+# reboot to fastboot (PMIC restart reason; needs boot-arg sweetpmem=1): install to /var/local/bin
+build rebootbl jb/rebootbl.c
 build urlprops jb/urlprops.m -fobjc-arc -framework Foundation
 build haptic jb/haptic.c
 build auprobe jb/auprobe.c -framework CoreFoundation

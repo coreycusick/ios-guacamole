@@ -10,7 +10,7 @@
  * The register is reached over the SPMI PMIC arbiter v5 as execution environment 0, through /dev/pmem (boot-arg
  * sweetpmem=1, root): the PON peripheral's APID from the core's PPID table (owned by EE0), a read on its observer
  * channel (obsrvr + 0x80 * apid) and the write on its own channel (chnls + 0x10000 * apid; 0x80 * apid there was an
- * XPU violation -> CrashDump). Bit 0 of the register is kept. Then /var/jb/sbin/reboot.
+ * XPU violation -> CrashDump). Bit 0 of the register is kept. Then /var/jb/usr/sbin/reboot.
  * MIT, as userland/.
  */
 #include <errno.h>
@@ -130,7 +130,9 @@ int main(int argc, char **argv)
 		return 0;
 	fflush(stdout);
 	sync();
+	/* iOS 27 root: reboot is /var/jb/usr/sbin/reboot (/var/jb/sbin/reboot was the iOS 16 path) */
+	execl("/var/jb/usr/sbin/reboot", "reboot", (char *)NULL);
 	execl("/var/jb/sbin/reboot", "reboot", (char *)NULL);
-	fprintf(stderr, "rebootbl: exec /var/jb/sbin/reboot: %s (the reason stays set: reboot by hand)\n", strerror(errno));
+	fprintf(stderr, "rebootbl: exec /var/jb/usr/sbin/reboot: %s (the reason stays set: reboot by hand)\n", strerror(errno));
 	return 1;
 }
