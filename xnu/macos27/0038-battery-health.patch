@@ -1,0 +1,1026 @@
+# 2026-11-26: battery health (BQ27541/BQ27411 gauge, bsd/dev/sweet_gauge.c incl. read-only R_a table; BatteryData + Serial + WeightedRa/Ra00-14; AppleSmartBatteryPack + AppleSmartBatteryBank children for powerd's pack/bank data) + USB-C dual role and 5 V OTG VBUS (SweetBattery setupTypec/checkTypec, sweet_spmi.c writable list, sysctl kern.sweet_typec)
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@
+ bsd/dev/sweet_rtc.c			standard
+ bsd/dev/sweet_btuart.c			standard
+ bsd/dev/sweet_haptic.c			standard
++bsd/dev/sweet_gauge.c			standard
+ bsd/dev/sweet_camhw.c			standard
+ bsd/dev/sweet_passcode.c		standard
+ bsd/dev/sweet_abp.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_gauge.c
+@@ -0,0 +1,592 @@
++/*
++ * GUACAMOLE (OnePlus 7 Pro, SM8150) battery gauge: the TI BQ27541 at I2C 0x55 on QUP wrapper 1 SE0
++ * (DT i2c@a80000, Android i2c-3, qupv3_se8_i2c: SDA/SCL GPIO88/89 function qup8, 100 kHz), next to the
++ * Warp MCU (0x26, not touched). Android's "battery" power_supply (charge_full, cycle_count) is this chip.
++ * 2026-11-26. Read only on the chip. The boot chain leaves GPIO88/89 as plain GPIOs (every transfer timed
++ * out), so they are muxed here as Android's qupv3_se8_i2c_active: TLMM NORTH tile (0x03900000), function
++ * qup8 = mux 2 (pinctrl-sm8150.c PINGROUP(88/89, NORTH, tsif1, qup8, ...)), 2 mA, no bias.
++ *
++ * OnePlus's driver (bq27541_fuelgauger.c, CONFIG_GAUGE_BQ27411) finds one of two chips at 0x55, told apart by
++ * Control(DEVICE_TYPE) (write 0x00 = subcommand 0x0001, read 0x00): 0x0541 BQ27541, 0x0421 BQ27411. Both
++ * 16-bit little endian. BQ27541 (TI SLUSA10): temp 0x06 (0.1 K), volt 0x08 (mV), flags 0x0a, remaining 0x10,
++ * full charge 0x12 (mAh), avg current 0x14 (mA), cycle count 0x2a, SOC 0x2c (%), design 0x3c (mAh).
++ * BQ27411 (bq27421-G1 family, TI SLUUAC5): temp 0x02, volt 0x04, flags 0x06, remaining 0x0c, full charge
++ * 0x0e, avg current 0x10, SOC 0x1c, design 0x3c; no cycle count command (reported as 0).
++ * The DEVICE_TYPE subcommand is the only write; it changes nothing in the chip.
++ *
++ * Clocks (Linux gcc-sm8150.c): APCS vote 0x5200c bits 18/19 (wrap1 core 2x / core), 20 (m_ahb), 21 (s_ahb),
++ * 22 (wrap1 s0); RCG gcc_qupv3_wrap1_s0_clk_src 0x18148; branches 0x18004 / 0x18008 / 0x18144.
++ * The GENI I2C engine is sweet_haptic.c's (sweet_touch.c's), on its own SE and state.
++ *
++ * sweet_gauge_read() (SweetBattery, every 5 minutes): 0 and the values, or an errno. Boot-arg sweetgauge=0
++ * turns it off; boards with an ADT /sweet-board (hotdogg) are off for now. sysctl kern.sweet_gauge (read): a fresh reading as text.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++struct sweet_gauge {
++	unsigned fcc, design, remaining, cycles, soc, mv, flags;
++	int ma, decikelvin;
++	unsigned ra_ok;         /* 2026-11-27: 1 when ra[] holds the BQ27411 R_a table (read once at setup) */
++	uint16_t ra[15];
++};
++int sweet_gauge_read(struct sweet_gauge *g);
++
++#define GA_SE_PA        0x00a80000u /* QUP wrapper 1, SE0 (qupv3_se8) */
++#define GA_GCC_PA       0x00100000u
++#define GA_GCC_VOTE     0x5200cu
++#define GA_GCC_MASK     ((1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22))
++#define GA_RCG          0x18148u
++#define GA_ADDR         0x55u
++#define GA_NORTH_PA     0x03900000u
++#define GA_SDA          88u
++#define GA_SCL          89u
++#define GA_CFG(n)       ((uint32_t)(n) * 0x1000u)
++
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu
++#define SE_RX_LEN       0x270u
++#define SE_SCL          0x278u
++#define SE_CMD          0x600u
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM_IRQ    (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_IRQ    (1u << 30)
++#define SE_DONE         (1u << 0)
++#define SE_NACK         (1u << 10)
++#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++static struct {
++	vm_offset_t gcc, se, north;
++	unsigned clk_sel, sent, got, fails, type;
++	uint16_t ra[15];        /* 2026-11-27: BQ27411 R_a table (data class 89), read once; ra_ok when read */
++	bool ra_ok;
++	int ra_err;
++	bool tried, ready, dead, off;
++	uint32_t irq_last;
++	int err_last;
++} ga;
++/* the last message also kept for sysctl kern.sweet_gauge (the boot log may have scrolled away) */
++static char ga_why[1024];
++#define GA_LOG(...) do { char _l[160]; printf(__VA_ARGS__); snprintf(_l, sizeof(_l), __VA_ARGS__); \
++	if (strlen(ga_why) + strlen(_l) < sizeof(ga_why)) strlcat(ga_why, _l, sizeof(ga_why)); } while (0)
++static LCK_GRP_DECLARE(ga_grp, "sweet-gauge");
++static LCK_MTX_DECLARE(ga_lock, &ga_grp);
++
++static uint32_t
++ga_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++ga_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++ga_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(ga_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++ga_clocks(void)
++{
++	ga_wr(ga.gcc, GA_GCC_VOTE, ga_rd(ga.gcc, GA_GCC_VOTE) | GA_GCC_MASK);
++	uint32_t dfs = ga_rd(ga.gcc, GA_RCG + 0x14u), cfg = ga_rd(ga.gcc, GA_RCG + 4u);
++	GA_LOG("SWEET GAUGE: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n", ga_rd(ga.gcc, GA_GCC_VOTE),
++	    ga_rd(ga.gcc, GA_RCG), cfg, dfs);
++	ga.clk_sel = 0;
++	if (dfs & 1u) {
++		int level = -1;
++		for (unsigned l = 0; l < 8; ++l) {
++			uint32_t lc = ga_rd(ga.gcc, GA_RCG + 0x1cu + 4u * l);
++			if (level < 0 && (lc & 0x371fu) == 1u) {
++				level = (int)l;
++			}
++		}
++		if (level < 0) {
++			GA_LOG("SWEET GAUGE: no XO/1 DFS level\n");
++			return false;
++		}
++		ga.clk_sel = (unsigned)level;
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		ga_wr(ga.gcc, GA_RCG + 4u, cfg);
++		ga_wr(ga.gcc, GA_RCG, ga_rd(ga.gcc, GA_RCG) | 1u);
++		if (!ga_wait_clear(ga.gcc, GA_RCG, 1u)) {
++			GA_LOG("SWEET GAUGE: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t branches[] = {0x18004, 0x18008, 0x18144};
++	for (unsigned i = 0; i < 3; ++i) {
++		if (ga_wait_clear(ga.gcc, branches[i], 1u << 31)) {
++			continue;
++		}
++		uint32_t v = ga_rd(ga.gcc, branches[i]);
++		if (i < 2 && (v & 2u)) {
++			continue;               /* AHB branch in HW clock gating: not polled (Linux) */
++		}
++		GA_LOG("SWEET GAUGE: GCC branch %#x halted (%#x)\n", branches[i], v);
++		return false;
++	}
++	return true;
++}
++
++static void
++ga_abort(void)
++{
++	ga_wr(ga.se, SE_CTRL, 2);
++	bool done = false;
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (ga_rd(ga.se, SE_IRQ) & (1u << 5)) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || !ga_wait_clear(ga.se, SE_STATUS, 1u)) {
++		ga.dead = true;
++		GA_LOG("SWEET GAUGE: abort failed; stopping\n");
++	}
++	for (unsigned i = 0; i < 64 && (ga_rd(ga.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)ga_rd(ga.se, SE_RX);
++	}
++	ga_wr(ga.se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* one FIFO message: TX at most 3 bytes or RX at most 64 */
++static int
++ga_msg(const uint8_t *tx, unsigned nt, uint8_t *rx, unsigned nr, bool stretch)
++{
++	if (ga.dead || nt > 3 || nr > 64 || (nt && nr) || (!nt && !nr)) {
++		return EIO;
++	}
++	ga.sent = ga.got = 0;
++	if (!ga_wait_clear(ga.se, SE_STATUS, 1u)) {
++		ga.dead = true;
++		return EBUSY;
++	}
++	ga_wr(ga.se, SE_IRQ_CLR, 0xffffffffu);
++	ga_wr(ga.se, SE_TX_WM, nt ? 1u : 0u);
++	ga_wr(ga.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	ga_wr(ga.se, SE_CMD, ((nr ? 2u : 1u) << 27) | ((uint32_t)GA_ADDR << 9) | (stretch ? 4u : 0u));
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 20000; ++i) {
++		uint32_t irq = ga.irq_last = ga_rd(ga.se, SE_IRQ);
++		if (irq & SE_ERRORS) {
++			err = (irq & SE_NACK) ? ENXIO : EIO;
++			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
++				delay(1);
++				irq = ga_rd(ga.se, SE_IRQ);
++			}
++			if ((irq & SE_DONE) && !(ga_rd(ga.se, SE_STATUS) & 1u) &&
++			    !(ga_rd(ga.se, SE_TX_COUNT) & 0xfffffffu) && !(ga_rd(ga.se, SE_RX_COUNT) & 0x1ffffffu)) {
++				ga_wr(ga.se, SE_IRQ_CLR, irq);
++				return err;
++			}
++			break;
++		}
++		if (nt && !ga.sent && (irq & SE_TX_WM_IRQ)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < nt; ++j) {
++				word |= (uint32_t)tx[j] << (8u * j);
++			}
++			ga_wr(ga.se, SE_TX, word);
++			ga.sent = nt;
++			ga_wr(ga.se, SE_TX_WM, 0);
++		}
++		uint32_t count = ga_rd(ga.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 16 || (nr && count > (nr - ga.got + 3u) / 4u)) {
++			err = EIO;
++			break;
++		}
++		while (count--) {
++			uint32_t word = ga_rd(ga.se, SE_RX);
++			for (unsigned j = 0; j < 4 && ga.got < nr; ++j) {
++				rx[ga.got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = ga_rd(ga.se, SE_IRQ);
++			if (irq & SE_ERRORS) {
++				continue;
++			}
++			ga_wr(ga.se, SE_IRQ_CLR, irq);
++			if (ga.got == nr && ga.sent == nt) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		ga_wr(ga.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	ga_abort();
++	return err;
++}
++
++/* a 16-bit command: write the register, repeated start, read 2 bytes; retried once (the chip may be asleep) */
++static int
++ga_word(uint8_t reg, unsigned *val)
++{
++	int err = EIO;
++	for (unsigned attempt = 0; attempt < 2; ++attempt) {
++		uint8_t b[2] = {0, 0};
++		err = ga_msg(&reg, 1, NULL, 0, true);
++		err = err ? err : ga_msg(NULL, 0, b, 2, false);
++		if (!err) {
++			*val = (unsigned)b[0] | ((unsigned)b[1] << 8);
++			return 0;
++		}
++		delay(2000);
++	}
++	return err;
++}
++
++static bool
++ga_se_init(void)
++{
++	uint32_t fw = ga_rd(ga.se, SE_FW);
++	uint32_t tx = ga_rd(ga.se, SE_HW_TX), rx = ga_rd(ga.se, SE_HW_RX);
++	GA_LOG("SWEET GAUGE: se fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n", fw, (fw >> 8) & 0xffu,
++	    ga_rd(ga.se, SE_STATUS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 3u || (ga_rd(ga.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u) {
++		GA_LOG("SWEET GAUGE: SE8 has no I2C protocol firmware loaded by the boot chain (proto %u); stopping\n",
++		    (fw >> 8) & 0xffu);
++		return false;
++	}
++	if (ga_rd(ga.se, SE_STATUS) & 0x1001u) {
++		GA_LOG("SWEET GAUGE: SE8 busy; stopping\n");
++		return false;
++	}
++	ga_wr(ga.se, 0xe18, 0);
++	ga_wr(ga.se, 0xe1c, 0);
++	ga_wr(ga.se, 0x644, 0);
++	ga_wr(ga.se, SE_IRQ_CLR, 0xffffffffu);
++	ga_wr(ga.se, 0x648, 0xffffffffu);
++	ga_wr(ga.se, SE_DMA, 0);
++	ga_wr(ga.se, 0x28, ga_rd(ga.se, 0x28) | 0x7fu);
++	ga_wr(ga.se, 0xe30, ga_rd(ga.se, 0xe30) | 0x0fu);
++	ga_wr(ga.se, 0x24, 0x7f);
++	ga_wr(ga.se, 0x20, 1);
++	ga_wr(ga.se, SE_CLK_SEL, ga.clk_sel);
++	ga_wr(ga.se, SE_MCLK, (7u << 4) | 1u);              /* 100 kHz from 19.2 MHz (DT qcom,clk-freq-out) */
++	ga_wr(ga.se, SE_SCL, (10u << 20) | (11u << 10) | 26u);
++	ga_wr(ga.se, 0x254, 0);
++	ga_wr(ga.se, 0x260, SE_PACK0);
++	ga_wr(ga.se, 0x264, SE_PACK1);
++	ga_wr(ga.se, 0x284, SE_PACK0);
++	ga_wr(ga.se, 0x288, SE_PACK1);
++	ga_wr(ga.se, SE_TX_WM, 0);
++	ga_wr(ga.se, 0x810, 0);
++	ga_wr(ga.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	ga_wr(ga.se, SE_IRQ_EN, SE_EVENTS);
++	return ga_rd(ga.se, 0x260) == SE_PACK0 && ga_rd(ga.se, 0x284) == SE_PACK0 &&
++	       !(ga_rd(ga.se, SE_TX_COUNT) & 0xfffffffu) && !(ga_rd(ga.se, SE_RX_COUNT) & 0x1ffffffu);
++}
++
++/* Control() subcommand, as OnePlus's bq27541_cntl_cmd: write 0x00 = LSB, MSB */
++static int
++ga_cntl(unsigned sub)
++{
++	const uint8_t tx[3] = {0x00, (uint8_t)sub, (uint8_t)(sub >> 8)};
++	return ga_msg(tx, 3, NULL, 0, false);
++}
++
++/* CONTROL_STATUS bit 13 (SS): sealed (BQ27411; OnePlus's sealed()) */
++static int
++ga_sealed(bool *sealed)
++{
++	unsigned st = 0;
++	int err = ga_cntl(0x0000);
++	delay(10000);
++	err = err ? err : ga_word(0x00, &st);
++	if (!err) {
++		*sealed = (st & (1u << 13)) != 0;
++	}
++	return err;
++}
++
++/*
++ * 2026-11-27: the BQ27411's R_a table (TI bq27421-G1 TRM: data class 89 "R_a RAM", block 0, 15 big-endian 16-bit
++ * values, the cell's resistance per depth of discharge), which powerd's battery health wants as Ra00-Ra14 and
++ * WeightedRa. Read only: unseal as OnePlus does (Control 0x8000 twice), BlockDataControl (0x61) = 0, DataClass
++ * (0x3e) = 89, DataBlock (0x3f) = 0, read 0x40-0x5f, then seal again (Control 0x0020) if it was sealed. No config
++ * mode, no write to data memory. Called once from ga_setup with ga_lock held. Handed to SweetBattery
++ * (sweet_gauge_read ra[]), which publishes it for powerd as Ra00-Ra14 and WeightedRa.
++ */
++static void
++ga_read_ra(void)
++{
++	bool was_sealed = true, sealed = true;
++	int err = ga_sealed(&was_sealed);
++	if (!err && was_sealed) {
++		for (unsigned attempt = 0; attempt < 5 && sealed && !err; ++attempt) {
++			err = ga_cntl(0x8000);
++			delay(10000);
++			err = err ? err : ga_cntl(0x8000);
++			delay(10000);
++			err = err ? err : ga_sealed(&sealed);
++		}
++	} else {
++		sealed = was_sealed;
++	}
++	uint8_t blk[32];
++	memset(blk, 0, sizeof(blk));
++	if (!err && !sealed) {
++		const uint8_t c1[2] = {0x61, 0x00}, c2[2] = {0x3e, 89}, c3[2] = {0x3f, 0x00}, r0 = 0x40;
++		err = ga_msg(c1, 2, NULL, 0, false);
++		delay(5000);
++		err = err ? err : ga_msg(c2, 2, NULL, 0, false);
++		delay(1000);
++		err = err ? err : ga_msg(c3, 2, NULL, 0, false);
++		delay(10000);
++		err = err ? err : ga_msg(&r0, 1, NULL, 0, true);
++		err = err ? err : ga_msg(NULL, 0, blk, 32, false);
++	} else if (!err) {
++		err = EPERM;                            /* still sealed */
++	}
++	if (was_sealed) {
++		(void)ga_cntl(0x0020);                  /* SEALED again */
++		delay(10000);
++		bool now = false;
++		(void)ga_sealed(&now);
++		if (!now) {
++			GA_LOG("SWEET GAUGE: WARNING: gauge left unsealed\n");
++		}
++	}
++	ga.ra_err = err;
++	if (err) {
++		GA_LOG("SWEET GAUGE: R_a table not read: err %d (was sealed %d, sealed %d)\n", err, was_sealed, sealed);
++		return;
++	}
++	for (unsigned i = 0; i < 15; ++i) {
++		ga.ra[i] = (uint16_t)(((unsigned)blk[2 * i] << 8) | blk[2 * i + 1]);
++	}
++	ga.ra_ok = true;
++	GA_LOG("SWEET GAUGE: R_a: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u (bytes 30-31 %02x %02x)\n",
++	    ga.ra[0], ga.ra[1], ga.ra[2], ga.ra[3], ga.ra[4], ga.ra[5], ga.ra[6], ga.ra[7], ga.ra[8], ga.ra[9],
++	    ga.ra[10], ga.ra[11], ga.ra[12], ga.ra[13], ga.ra[14], blk[30], blk[31]);
++}
++
++/* first use: map, clocks, SE; once (a failure is final until reboot). Called with ga_lock held. */
++static void
++ga_setup(void)
++{
++	ga.tried = true;
++	int on = 1;
++	(void)PE_parse_boot_argn("sweetgauge", &on, sizeof(on));
++	if (!on) {
++		ga.off = true;
++		GA_LOG("SWEET GAUGE: off (boot-arg sweetgauge=0)\n");
++		return;
++	}
++	DTEntry board;
++	if (SecureDTLookupEntry(NULL, "/sweet-board", &board) == kSuccess) {
++		ga.off = true;          /* another board (hotdogg): its gauge's bus is not known yet */
++		GA_LOG("SWEET GAUGE: off (ADT /sweet-board: not guacamole)\n");
++		return;
++	}
++	ga.gcc = ml_io_map(GA_GCC_PA, 0x60000);
++	ga.se = ml_io_map(GA_SE_PA, 0x4000);
++	ga.north = ml_io_map(GA_NORTH_PA, GA_CFG(GA_SCL + 1));
++	if (ga.north) {
++		uint32_t sda = ga_rd(ga.north, GA_CFG(GA_SDA)), scl = ga_rd(ga.north, GA_CFG(GA_SCL));
++		for (unsigned pin = GA_SDA; pin <= GA_SCL; ++pin) {
++			uint32_t cfg = ga_rd(ga.north, GA_CFG(pin)) & ~0x3ffu;   /* func, pull, drive, oe */
++			ga_wr(ga.north, GA_CFG(pin), cfg | (2u << 2));          /* qup8, no pull, 2 mA, input */
++		}
++		GA_LOG("SWEET GAUGE: GPIO88/89 cfg %#x/%#x -> %#x/%#x, in %#x/%#x\n", sda, scl,
++		    ga_rd(ga.north, GA_CFG(GA_SDA)), ga_rd(ga.north, GA_CFG(GA_SCL)),
++		    ga_rd(ga.north, GA_CFG(GA_SDA) + 4u) & 1u, ga_rd(ga.north, GA_CFG(GA_SCL) + 4u) & 1u);
++	}
++	if (!ga.gcc || !ga.se || !ga.north || !ga_clocks() || !ga_se_init()) {
++		ga.dead = true;
++		return;
++	}
++	const uint8_t devtype[3] = {0x00, 0x01, 0x00};          /* Control(): subcommand DEVICE_TYPE */
++	unsigned type = 0;
++	int err = ga_msg(devtype, 3, NULL, 0, false);
++	delay(100);                                               /* OnePlus waits 66 us */
++	err = err ? err : ga_word(0x00, &type);
++	GA_LOG("SWEET GAUGE: device type %#x err %d (0x541 BQ27541, 0x421 BQ27411)\n", type, err);
++	if (err || (type != 0x0541u && type != 0x0421u)) {
++		/* not answered as expected: tell the two layouts apart by a plausible voltage (BQ27541 0x08, BQ27411 0x04) */
++		unsigned v541 = 0, v411 = 0, soc541 = 0;
++		int e1 = ga_word(0x08, &v541), e2 = ga_word(0x04, &v411), e3 = ga_word(0x2c, &soc541);
++		GA_LOG("SWEET GAUGE: probe: 0x08=%u (%d) 0x04=%u (%d) 0x2c=%u (%d)\n", v541, e1, v411, e2, soc541, e3);
++		if (!e1 && v541 >= 2800 && v541 <= 4600 && !e3 && soc541 <= 100) {
++			type = 0x0541u;
++		} else if (!e2 && v411 >= 2800 && v411 <= 4600) {
++			type = 0x0421u;
++		} else {
++			ga.dead = true;
++			GA_LOG("SWEET GAUGE: unknown gauge; not used\n");
++			return;
++		}
++		GA_LOG("SWEET GAUGE: using the %s layout\n", type == 0x0541u ? "BQ27541" : "BQ27411");
++	}
++	ga.type = type;
++	ga.ready = true;
++	if (type == 0x0421u) {
++		ga_read_ra();
++	}
++}
++
++int
++sweet_gauge_read(struct sweet_gauge *g)
++{
++	lck_mtx_lock(&ga_lock);
++	if (!ga.tried) {
++		ga_setup();
++	}
++	int err = ga.off ? ENOTSUP : (!ga.ready || ga.dead) ? ENODEV : 0;
++	unsigned t = 0, v = 0, f = 0, rm = 0, fcc = 0, ai = 0, cc = 0, soc = 0, dc = 0;
++	bool b411 = ga.type == 0x0421u;
++	err = err ? err : ga_word(b411 ? 0x0e : 0x12, &fcc);
++	err = err ? err : ga_word(0x3c, &dc);
++	err = err ? err : (b411 ? 0 : ga_word(0x2a, &cc));
++	err = err ? err : ga_word(b411 ? 0x1c : 0x2c, &soc);
++	err = err ? err : ga_word(b411 ? 0x0c : 0x10, &rm);
++	err = err ? err : ga_word(b411 ? 0x04 : 0x08, &v);
++	err = err ? err : ga_word(b411 ? 0x10 : 0x14, &ai);
++	err = err ? err : ga_word(b411 ? 0x02 : 0x06, &t);
++	err = err ? err : ga_word(b411 ? 0x06 : 0x0a, &f);
++	if (err != ga.err_last && err != ENOTSUP) {
++		printf("SWEET GAUGE: BQ27541 at %#x: %s %d (irq %#x)\n", GA_ADDR, err ? "error" : "reading again after error",
++		    err, ga.irq_last);
++	}
++	ga.err_last = err;
++	if (err) {
++		if (err != ENOTSUP && err != ENODEV && ++ga.fails >= 12) {
++			ga.dead = true;                 /* an hour of failures: stop touching the bus */
++			GA_LOG("SWEET GAUGE: 12 failed readings; stopping\n");
++		}
++	} else {
++		ga.fails = 0;
++		g->fcc = fcc;
++		g->design = dc;
++		g->cycles = cc;
++		g->soc = soc;
++		g->remaining = rm;
++		g->mv = v;
++		g->ma = (int)(int16_t)ai;
++		g->decikelvin = (int)t;
++		g->flags = f;
++		g->ra_ok = ga.ra_ok ? 1u : 0u;
++		memcpy(g->ra, ga.ra, sizeof(g->ra));
++	}
++	lck_mtx_unlock(&ga_lock);
++	return err;
++}
++
++static int
++sysctl_sweet_gauge SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	struct sweet_gauge g = {};
++	char buf[1200];
++	int err = sweet_gauge_read(&g);
++	if (err) {
++		snprintf(buf, sizeof(buf), "error %d (irq %#x) last: %s", err, ga.irq_last, ga_why);
++	} else {
++		snprintf(buf, sizeof(buf), "%s fcc %u mAh design %u mAh health %u%% cycles %u soc %u%% remaining %u mAh "
++		    "%u mV %d mA %d.%d C flags %#x", ga.type == 0x0421u ? "BQ27411" : "BQ27541", g.fcc, g.design, g.design ? g.fcc * 100u / g.design : 0, g.cycles,
++		    g.soc, g.remaining, g.mv, g.ma, (g.decikelvin - 2732) / 10, ((g.decikelvin - 2732) % 10 + 10) % 10, g.flags);
++		size_t n = strlen(buf);                 /* 2026-11-27: the setup log too (the boot log scrolls away) */
++		snprintf(buf + n, sizeof(buf) - n, "\n%s", ga_why);
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gauge, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_gauge, "A", "BQ27541 battery gauge: a fresh reading");
++
++
++/*
++ * 2026-11-26: USB-C (SweetBattery setupTypec/checkTypec) keeps its messages here too, and sysctl
++ * kern.sweet_typec (read) prints them with a live read of the PM8150B Type-C and OTG registers.
++ */
++#include <stdarg.h>
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++static char tc_log[1024];
++void sweet_typec_note(const char *fmt, ...);
++void
++sweet_typec_note(const char *fmt, ...)
++{
++	char line[192];
++	va_list ap;
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	size_t n = strlen(tc_log), l = strlen(line);
++	if (n + l >= sizeof(tc_log)) {            /* keep the first half (boot setup), drop the rest */
++		tc_log[sizeof(tc_log) / 2] = 0;
++		n = strlen(tc_log);
++	}
++	if (n + l < sizeof(tc_log)) {
++		strlcat(tc_log, line, sizeof(tc_log));
++	}
++}
++
++static int
++sysctl_sweet_typec SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static const uint16_t regs[] = {0x1506, 0x1508, 0x1509, 0x150b, 0x150d, 0x1544, 0x1546, 0x1140, 0x1152,
++	    0x1153, 0x110b, 0x1310};
++	char buf[1600];
++	size_t n = 0;
++	buf[0] = 0;
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && n < 300; ++i) {
++		uint8_t v = 0;
++		int e = sweet_spmi_read(2, regs[i], &v);
++		n += (size_t)snprintf(buf + n, sizeof(buf) - n, e ? "%#x=err%d " : "%#x=%#04x ", regs[i], e ? e : v);
++	}
++	snprintf(buf + n, sizeof(buf) - n, "\n%s", tc_log);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_typec, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_typec, "A", "USB-C: live PM8150B registers and the SweetBattery Type-C log");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -134,7 +134,12 @@
+ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ {
+-	static const unsigned writable[] = { 0x1061, 0x1342, 0x1365, 0x1366, 0x1370 };
++	/*
++	 * 2026-11-26: + USB-C host power (SweetBattery setupTypec/checkTypec, as OnePlus's qpnp-smb5.c /
++	 * smb5-lib.c): DCDC_CMD_OTG 0x1140, DCDC_OTG_CURRENT_LIMIT_CFG 0x1152, DCDC_OTG_CFG 0x1153,
++	 * TYPE_C_MODE_CFG 0x1544
++	 */
++	static const unsigned writable[] = { 0x1061, 0x1342, 0x1365, 0x1366, 0x1370, 0x1140, 0x1152, 0x1153, 0x1544 };
+ 	bool allowed = false;
+ 	for (unsigned i = 0; i < sizeof(writable) / sizeof(writable[0]); ++i) {
+ 		allowed |= sid == 2 && addr == writable[i];
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -38,6 +38,37 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++/* bsd/dev/sweet_gauge.c: the BQ27541 (2026-11-26, battery health) */
++struct sweet_gauge {
++	unsigned fcc, design, remaining, cycles, soc, mv, flags;
++	int ma, decikelvin;
++	unsigned ra_ok;
++	uint16_t ra[15];
++};
++extern "C" int sweet_gauge_read(struct sweet_gauge *g);
++extern "C" void sweet_typec_note(const char *fmt, ...) __printflike(1, 2);
++/* USB-C messages: the kernel log and sysctl kern.sweet_typec */
++#define TC_LOG(...) do { IOLog(__VA_ARGS__); sweet_typec_note(__VA_ARGS__); } while (0)
++
++/*
++ * 2026-11-27: powerd's battery health reads per-pack data from an "AppleSmartBatteryPack" service (IOServiceMatching,
++ * property "ID" = pack index, dictionary "BatteryData" with "Serial" and the capacities; powerd 27.2 ~0x10004a228).
++ * On an iPhone that is the battery driver's child; here SweetBattery makes one and keeps its BatteryData current.
++ * It carries the same gauge readings as SweetBattery itself and claims nothing else.
++ */
++class AppleSmartBatteryPack : public IOService {
++	OSDeclareDefaultStructors(AppleSmartBatteryPack);
++};
++OSDefineMetaClassAndStructors(AppleSmartBatteryPack, IOService);
++/*
++ * 2026-11-27: powerd reads the cell resistance (WeightedRa) per bank: the pack's "BankCount" and its
++ * AppleSmartBatteryBank children (found by order), each with its own "BatteryData" (powerd 27.2,
++ * _findBankEntryByIndex / _readPackAndBankBatteryData / _batteryBankDataForPack). One cell, one bank.
++ */
++class AppleSmartBatteryBank : public IOService {
++	OSDeclareDefaultStructors(AppleSmartBatteryBank);
++};
++OSDefineMetaClassAndStructors(AppleSmartBatteryBank, IOService);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -56,6 +87,18 @@
+ 	unsigned fTemperature;          /* centidegrees C */
+ 	int fLastUsbIn;                 /* 2026-11-26: USBIN present at the last 1 s check (-1 not read yet) */
+ 	unsigned fTicks;                /* 1 s checks since the last full poll */
++	unsigned fGaugeFcc, fGaugeDesign, fCycles;  /* 2026-11-26: BQ27541 learned capacity, its design, cycles */
++	bool fGaugeOK;
++	void pollGauge(void);
++	bool fRaOK;                     /* 2026-11-27: the gauge's R_a table (resistance per depth of discharge) */
++	uint16_t fRa[15];
++	unsigned fWeightedRa;
++	AppleSmartBatteryPack *fPack;   /* 2026-11-27: powerd's pack service (see above) */
++	AppleSmartBatteryBank *fBank;   /* its one bank */
++	bool fOtg, fOtgOn;              /* 2026-11-26: USB-C source role allowed (sweetotg); our 5 V VBUS is on */
++	uint8_t fTypecSeen[3];
++	void setupTypec(void);
++	void checkTypec(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -111,6 +154,14 @@
+ 	fTemperature = 2500;
+ 	fLastUsbIn = -1;
+ 	fTicks = 0;
++	fGaugeFcc = fGaugeDesign = fCycles = 0;
++	fGaugeOK = false;
++	fRaOK = false;
++	fWeightedRa = 0;
++	fPack = NULL;
++	fBank = NULL;
++	fOtg = fOtgOn = false;
++	fTypecSeen[0] = fTypecSeen[1] = fTypecSeen[2] = 0xff;
+ 	return true;
+ }
+ 
+@@ -140,11 +191,17 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (fDesign). powerd computes C*100/M. */
+-	const unsigned capacity = (fDesign * percent + 50u) / 100u;
++	/*
++	 * Use consistent mAh units. powerd computes C*100/M. 2026-11-26: with the BQ27541 read (pollGauge), the
++	 * maximum is its learned full charge capacity and the design its design capacity (battery health =
++	 * max / design); otherwise both are fDesign.
++	 */
++	const unsigned design = fGaugeOK ? fGaugeDesign : fDesign;
++	const unsigned max = fGaugeOK ? fGaugeFcc : fDesign;
++	const unsigned capacity = (max * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(fDesign);
++	setMaxCapacity(max);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -154,12 +211,80 @@
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+ 	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	setCycleCount(fCycles);  /* the BQ27541's cycle count (0 until read) */
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", fDesign);
+-	putNumber("DesignCapacity", fDesign);
++	putNumber("AppleRawMaxCapacity", max);
++	putNumber("NominalChargeCapacity", max);
++	putNumber("DesignCapacity", design);
++	putNumber("DesignCycleCount9C", 1000);
++	putNumber("MaximumCapacityPercent", design ? (max * 100u + design / 2u) / design : 100u);
++	/*
++	 * 2026-11-27: powerd's battery health (pack data) finds this service by its "ID" (pack 0) and reads its
++	 * "BatteryData" dictionary: Serial (17-19 characters), RemainingCapacity, MaxCapacity, DesignCapacity,
++	 * Voltage, AverageCurrent, CycleCount, NominalChargeCapacity, FullyCharged, StateOfCharge,
++	 * DesignCycleCount70 / 9C (powerd 27.2, around 0x10004a4a4). Without a Serial: "Failed to get serial
++	 * number from pack" and Settings' Battery Health has no data. The BQ27411 has no serial number, so a
++	 * fixed ID that is plainly not an Apple serial: it only lets powerd see the same battery across boots.
++	 */
++	putNumber("ID", 0);
++	if (fKind == 2) {
++		OSDictionary *data = OSDictionary::withCapacity(12);
++		if (data) {
++			const char *keys[] = {"CycleCount", "DesignCapacity", "NominalChargeCapacity", "MaxCapacity",
++			    "RemainingCapacity", "MaximumCapacityPercent", "StateOfCharge", "Voltage", "AverageCurrent",
++			    "DesignCycleCount70", "DesignCycleCount9C"};
++			UInt32 values[] = {fCycles, design, max, max, capacity, design ? (max * 100u + design / 2u) / design : 100u,
++			    percent, mv, (UInt32)ma, 1000, 1000};
++			for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++				OSNumber *number = OSNumber::withNumber(values[i], 32);
++				if (number) {
++					data->setObject(keys[i], number);
++					number->release();
++				}
++			}
++			data->setObject("FullyCharged", full ? kOSBooleanTrue : kOSBooleanFalse);
++			if (fRaOK) {
++				OSNumber *w = OSNumber::withNumber(fWeightedRa, 32);
++				if (w) {
++					data->setObject("WeightedRa", w);
++					w->release();
++				}
++				for (unsigned i = 0; i < 15; ++i) {
++					char key[8];
++					snprintf(key, sizeof(key), "Ra%02u", i);
++					OSNumber *n = OSNumber::withNumber(fRa[i], 32);
++					if (n) {
++						data->setObject(key, n);
++						n->release();
++					}
++				}
++			}
++			OSString *serial = OSString::withCString("GUAC-BQ27411-0001");
++			if (serial) {
++				data->setObject("Serial", serial);
++				const OSSymbol *serialKey = OSSymbol::withCString("Serial");
++				if (serialKey) {
++					setPSProperty(serialKey, serial);
++					serialKey->release();
++				}
++				serial->release();
++			}
++			const OSSymbol *symbol = OSSymbol::withCString("BatteryData");
++			if (symbol) {
++				setPSProperty(symbol, data);
++				symbol->release();
++			}
++			if (fPack) {
++				fPack->setProperty("BatteryData", data);
++			}
++			if (fBank) {
++				fBank->setProperty("BatteryData", data);
++			}
++			data->release();
++		}
++	}
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; 25 C unless measured (fKind 2). */
+ 	putNumber("Temperature", fTemperature);
+@@ -176,7 +301,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, fDesign, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, max, mv, (UInt32)ma, fCycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -280,6 +405,9 @@
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	fPolls++;
++	if (fPolls % 10 == 2) {         /* the gauge: the first timer poll (30-60 s after start), then every 5 min */
++		pollGauge();
++	}
+ 	if (!valid) {
+ 		fTemperature = 2500;
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+@@ -302,7 +430,7 @@
+ 			fTemperature = (unsigned)centi;
+ 		}
+ 	}
+-	bool external = (usb & 0x10u) != 0;
++	bool external = (usb & 0x10u) != 0 && !fOtgOn;   /* our own OTG VBUS is not a charger */
+ 	if (fCharge && external) {
+ 		configureCharging();
+ 	}
+@@ -314,6 +442,129 @@
+ 	publish(percent, mv, ma, external, capable, charging, full, true, currentValid);
+ }
+ 
++/*
++ * 2026-11-26: battery health from the BQ27541 (bsd/dev/sweet_gauge.c): its learned full charge capacity, its
++ * design capacity and its cycle count, used when plausible; a failed read keeps the last good values.
++ */
++void
++SweetBattery::pollGauge(void)
++{
++	struct sweet_gauge g = {};
++	int err = sweet_gauge_read(&g);
++	bool ok = !err && g.design >= 1000 && g.design <= 10000 && g.fcc >= g.design / 4u &&
++	    g.fcc <= g.design + g.design / 5u && g.cycles < 10000;
++	if (ok && (!fGaugeOK || g.fcc != fGaugeFcc || g.cycles != fCycles || fPolls % 120 == 2)) {
++		IOLog("SWEET BATTERY: BQ27541: full charge %u of %u mAh (%u%%), %u cycles, gauge %u%% %umV %dmA\n",
++		    g.fcc, g.design, (g.fcc * 100u + g.design / 2u) / g.design, g.cycles, g.soc, g.mv, g.ma);
++	} else if (!err && !ok) {
++		IOLog("SWEET BATTERY: BQ27541 values not plausible: fcc %u design %u cycles %u; not used\n",
++		    g.fcc, g.design, g.cycles);
++	}
++	/*
++	 * 2026-11-27: powerd's battery health also wants the cell resistance: BatteryData "WeightedRa" (a battery under
++	 * powerd's threshold, 492 here, is normal; above it, service; missing: health "not determined", which Settings
++	 * shows as an endless spinner) and Ra00-Ra14. The BQ27411's own R_a table (TI units, about milliohms) is used;
++	 * WeightedRa is the plain mean of Ra0-Ra12 (the last two only matter near empty). Apple's exact weighting is
++	 * not public, so this is an approximation of the same quantity, from the real cell.
++	 */
++	if (!err && g.ra_ok && !fRaOK) {
++		unsigned sum = 0;
++		bool sane = true;
++		for (unsigned i = 0; i < 15; ++i) {
++			fRa[i] = g.ra[i];
++			sane = sane && g.ra[i] > 0 && g.ra[i] < 5000;
++			if (i < 13) {
++				sum += g.ra[i];
++			}
++		}
++		if (sane) {
++			fWeightedRa = (sum + 6u) / 13u;
++			fRaOK = true;
++			IOLog("SWEET BATTERY: BQ27411 R_a table read, WeightedRa %u\n", fWeightedRa);
++		}
++	}
++	if (ok) {
++		fGaugeFcc = g.fcc;
++		fGaugeDesign = g.design;
++		fCycles = g.cycles;
++		fGaugeOK = true;
++	}
++}
++
++/*
++ * 2026-11-26: USB-C host power (step 1 of USB accessories). OnePlus's Android kernel (qpnp-smb5.c,
++ * smb5-lib.c op_set_prop_otg_switch, typec_sink_insertion; SM8150 P 9.0 source) keeps the port sink-only
++ * (TYPE_C_MODE_CFG 0x1544 EN_SNK_ONLY) unless the OTG switch in Settings is on, which sets EN_TRY_SNK
++ * (dual role, preferring sink: chargers and computers still see the phone as a device). When the Type-C
++ * state machine is attached (0x1509 bit 5) in source mode (TYPE_C_MISC_STATUS 0x150b bit 6) to a sink
++ * (TYPE_C_SRC_STATUS 0x1508: Rd-open or Rd-Ra), the dwc3 host start enables the "vbus_dwc3" regulator:
++ * DCDC_CMD_OTG 0x1140 bit 0 (smblib_vbus_regulator_enable), under software control (DCDC_OTG_CFG 0x1153
++ * bit 1 clear) with the DT's qcom,otg-cl-ua 1.5 A (DCDC_OTG_CURRENT_LIMIT_CFG 0x1152: (1500-500)/500 = 2).
++ * Here: the same, checked every second from timerFired. No USB data yet (the host controller is step 2),
++ * so an attached device gets power only. VCONN (e-marked adapters) is not driven. Boot-arg sweetotg=0
++ * leaves the port sink-only as Android does by default.
++ */
++void
++SweetBattery::setupTypec(void)
++{
++	int otg = 1;
++	(void)PE_parse_boot_argn("sweetotg", &otg, sizeof(otg));
++	uint8_t mode = 0, cfg = 0, cl = 0;
++	if (sweet_spmi_read(2, 0x1544, &mode) || sweet_spmi_read(2, 0x1153, &cfg) || sweet_spmi_read(2, 0x1152, &cl)) {
++		TC_LOG("SWEET TYPEC: PM8150B Type-C registers unreadable; off\n");
++		return;
++	}
++	TC_LOG("SWEET TYPEC: mode cfg %#x otg cfg %#x otg limit %#x (sweetotg=%d)\n", mode, cfg, cl, otg);
++	if (!otg) {
++		return;
++	}
++	int we = sweet_spmi_write(2, 0x1140, 0);                  /* VBUS off until a sink is seen */
++	int we2 = sweet_spmi_write(2, 0x1153, (uint8_t)(cfg & ~2u));   /* VBUS under software control */
++	int we3 = sweet_spmi_write(2, 0x1152, (uint8_t)((cl & ~7u) | 2u));  /* 1.5 A */
++	if (we || we2 || we3) {
++		TC_LOG("SWEET TYPEC: OTG register writes refused (%d %d %d)\n", we, we2, we3);
++	}
++	uint8_t now = 0;
++	for (unsigned i = 0; i < 10; ++i) {                       /* OnePlus retries this write */
++		(void)sweet_spmi_write(2, 0x1544, (uint8_t)((mode & ~0x1fu) | 0x10u));   /* EN_TRY_SNK */
++		IOSleep(30);
++		if (!sweet_spmi_read(2, 0x1544, &now) && (now & 0x1fu) == 0x10u) {
++			fOtg = true;
++			break;
++		}
++	}
++	TC_LOG("SWEET TYPEC: dual role (try.SNK) %s, mode cfg %#x\n", fOtg ? "on" : "FAILED", now);
++}
++
++void
++SweetBattery::checkTypec(void)
++{
++	uint8_t sm = 0, misc = 0, src = 0;
++	if (sweet_spmi_read(2, 0x1509, &sm) || sweet_spmi_read(2, 0x150b, &misc) || sweet_spmi_read(2, 0x1508, &src)) {
++		return;
++	}
++	bool attached = (sm & 0x20u) != 0, source = attached && (misc & 0x40u);
++	bool sink = source && (src & 0x0cu) != 0;                 /* Rd-open or Rd-Ra: a USB device */
++	bool vbusError = (misc & 0x10u) != 0;
++	bool want = sink && !vbusError;
++	if (sm != fTypecSeen[0] || misc != fTypecSeen[1] || src != fTypecSeen[2]) {
++		TC_LOG("SWEET TYPEC: state %#x misc %#x src %#x: %s%s%s\n", sm, misc, src,
++		    !attached ? "detached" : source ? (sink ? "device attached (phone is host)" : "source role, no device") :
++		    "phone is a device (charger / computer)", (misc & 2u) ? ", CC2" : attached ? ", CC1" : "",
++		    vbusError ? ", VBUS ERROR" : "");
++		fTypecSeen[0] = sm;
++		fTypecSeen[1] = misc;
++		fTypecSeen[2] = src;
++	}
++	if (want != fOtgOn) {
++		uint8_t cmd = 0;
++		(void)sweet_spmi_read(2, 0x1140, &cmd);
++		(void)sweet_spmi_write(2, 0x1140, (uint8_t)(want ? (cmd | 1u) : (cmd & ~1u)));
++		fOtgOn = want;
++		TC_LOG("SWEET TYPEC: 5 V VBUS %s%s\n", want ? "on" : "off", vbusError ? " (VBUS error)" : "");
++	}
++}
++
+ /* 0167: the attached source's input current limit (the header comment). */
+ void
+ SweetBattery::configureCharging(void)
+@@ -417,8 +668,12 @@
+ 		 * once and again 3 s later (charger type detection and the charge state settle by then). Otherwise the
+ 		 * full poll every 30 s as before.
+ 		 */
++		if (self->fOtg) {
++			self->checkTypec();
++		}
+ 		uint8_t usb = 0;
+-		int in = sweet_spmi_read(self->fKind == 2 ? 2 : 0, 0x1310, &usb) ? self->fLastUsbIn : ((usb & 0x10u) != 0);
++		int in = sweet_spmi_read(self->fKind == 2 ? 2 : 0, 0x1310, &usb) ? self->fLastUsbIn :
++		    ((usb & 0x10u) != 0 && !self->fOtgOn);
+ 		if (in != self->fLastUsbIn) {
+ 			self->fLastUsbIn = in;
+ 			self->fTicks = 27;              /* the follow-up full poll in 3 s */
+@@ -464,6 +719,24 @@
+ 		}
+ 		IOLog("SWEET BATTERY: design capacity %u mAh\n", fDesign);
+ 	}
++	if (fKind == 2) {
++		setupTypec();
++		fPack = OSTypeAlloc(AppleSmartBatteryPack);
++		if (fPack && fPack->init() && fPack->attach(this)) {
++			fPack->setProperty("ID", 0ULL, 32);      /* registered after SweetBattery itself (end of start) */
++			fPack->setProperty("BankCount", 1ULL, 32);
++			fBank = OSTypeAlloc(AppleSmartBatteryBank);
++			if (fBank && fBank->init() && fBank->attach(fPack)) {
++				fBank->setProperty("ID", 0ULL, 32);
++			} else {
++				OSSafeReleaseNULL(fBank);
++				IOLog("SWEET BATTERY: AppleSmartBatteryBank not created\n");
++			}
++		} else {
++			OSSafeReleaseNULL(fPack);
++			IOLog("SWEET BATTERY: AppleSmartBatteryPack not created\n");
++		}
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -480,6 +753,12 @@
+ 		}
+ 	}
+ 	registerService();
++	if (fPack) {
++		fPack->registerService();
++	}
++	if (fBank) {
++		fBank->registerService();
++	}
+ 	return true;
+ }
+ 
+@@ -511,6 +790,14 @@
+ void
+ SweetBattery::free(void)
+ {
++	if (fBank) {
++		fBank->detach(fPack);
++		OSSafeReleaseNULL(fBank);
++	}
++	if (fPack) {
++		fPack->detach(this);
++		OSSafeReleaseNULL(fPack);
++	}
+ 	OSSafeReleaseNULL(fTimer);
+ 	OSSafeReleaseNULL(fLoop);
+ 	IOPMPowerSource::free();
