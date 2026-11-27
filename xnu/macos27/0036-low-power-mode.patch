@@ -1,0 +1,89 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -110,6 +110,15 @@
+ extern void thread_deallocate(thread_t);
+ void sweet_cpufreq_boost(void);
+ 
++/*
++ * Low Power Mode (2026-11-26): sysctl kern.sweet_lowpower, written by sweet-displayd from iOS's own setting
++ * (powerd's notify state / NSProcessInfo lowPowerModeEnabled). While on: no touch boost and aim at 90 % busy;
++ * SweetFramebuffer lets a frame begin at most every 33.3 ms (the UI at ~30 fps), so there is less to do and the
++ * rows fall by themselves. (Take 1 also capped the rows at ~1.5 / 1.2 GHz: 22 fps, the CPU flat out.)
++ */
++#define GOV_LP_TARGET_PCT       90
++int sweet_lowpower;
++
+ static vm_offset_t gov_b[GOV_DOMAINS];
+ static uint32_t gov_khz[GOV_DOMAINS][OSM_LUT_ROWS], gov_rows[GOV_DOMAINS], gov_row[GOV_DOMAINS], gov_load[GOV_DOMAINS];
+ static bool gov_domain_on[GOV_DOMAINS], gov_running;
+@@ -161,7 +170,8 @@
+ 		sweet_cpu_idle_mach(idle1, GOV_CPUS);
+ 		t1 = mach_absolute_time();
+ 		uint64_t elapsed = t1 - t0;
+-		bool boost = t1 < gov_boost_until;
++		bool lp = sweet_lowpower != 0;
++		bool boost = !lp && t1 < gov_boost_until;
+ 		for (unsigned d = 0; d < GOV_DOMAINS; d++) {
+ 			if (!gov_domain_on[d]) {
+ 				continue;
+@@ -181,7 +191,7 @@
+ 			gov_load[d] = load;
+ 			uint32_t want = top;
+ 			if (!(boost && sweet_osm[d].big)) {
+-				uint64_t need = (uint64_t)gov_khz[d][gov_row[d]] * load / GOV_TARGET_PCT;
++				uint64_t need = (uint64_t)gov_khz[d][gov_row[d]] * load / (lp ? GOV_LP_TARGET_PCT : GOV_TARGET_PCT);
+ 				want = 0;
+ 				while (want < top && gov_khz[d][want] < need) {
+ 					want++;
+@@ -202,6 +212,8 @@
+ 
+ SYSCTL_INT(_kern, OID_AUTO, sweet_cpufreq_gov, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_cpufreq_gov, 0,
+     "CPU frequency governor: 1 = load based (default), 0 = every domain on its top row");
++SYSCTL_INT(_kern, OID_AUTO, sweet_lowpower, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_lowpower, 0,
++    "Low Power Mode (sweet-displayd mirrors iOS's): UI at ~30 fps, no touch boost, 90 % busy target");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_sched_qos, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_sched_qos, 0,
+     "utility/background threads on the little cores first: 1 (default), 0 = off");
+ 
+@@ -210,7 +222,7 @@
+     struct sysctl_req *req)
+ {
+ 	char s[400];
+-	int n = snprintf(s, sizeof(s), "gov %d qos %d%s", sweet_cpufreq_gov, sweet_sched_qos,
++	int n = snprintf(s, sizeof(s), "gov %d qos %d lowpower %d%s", sweet_cpufreq_gov, sweet_sched_qos, sweet_lowpower,
+ 	    gov_running ? "" : " (governor not running)");
+ 	for (unsigned d = 0; d < GOV_DOMAINS && n < (int)sizeof(s) - 80; d++) {
+ 		if (gov_domain_on[d]) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -186,6 +186,7 @@
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
++extern "C" int sweet_lowpower;          /* bsd/dev/sweet_cpufreq.c: Low Power Mode, set by sweet-displayd */
+ static uint32_t sweet_fb_vsync_us = SWEET_FB_VSYNC_US; /* adjustable synthetic display tick */
+ /*
+  * 0198: the panel's own refresh. The OnePlus 7 Pro's panel runs in DSI command mode and paces itself: the display
+@@ -3295,6 +3296,23 @@
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBSwapBegin:
++		/*
++		 * 2026-11-26 Low Power Mode (kern.sweet_lowpower, bsd/dev/sweet_cpufreq.c): a frame begins at most every
++		 * 33.3 ms, so the UI draws ~30 frames a second (fewer frames: less work, and the governor lowers the clocks).
++		 * CoreAnimation is paced by its swaps here, not by the vsync notifications (none registered: "vsyncs sent 0").
++		 */
++		if (sweet_lowpower) {
++			static uint64_t lp_next;
++			uint64_t period, now = mach_absolute_time();
++			nanoseconds_to_absolutetime(33333333ull, &period);
++			if (lp_next > now) {
++				uint64_t ns;
++				absolutetime_to_nanoseconds(lp_next - now, &ns);
++				IOSleep((unsigned)((ns + 999999ull) / 1000000ull));
++				now = mach_absolute_time();
++			}
++			lp_next = lp_next + period > now ? lp_next + period : now + period;
++		}
+ 		IOLockLock(fFB->fLock);
+ 		out[0] = ++fFB->fSwapID;
+ 		IOLockUnlock(fFB->fLock);
