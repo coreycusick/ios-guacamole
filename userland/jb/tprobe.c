@@ -13,6 +13,8 @@
  *                     priority, whether a time-constraint (real-time) policy is set, CPU use, name. Needs
  *                     task_for_pid: sign with tsample.plist.
  *   tprobe -c 0|1     set kern.timer.coalescing_enabled (root), then time the plain waits again.
+ *   tprobe -b         2026-11-27: what one clock read costs (mach_absolute_time, mach_continuous_time,
+ *                     clock_gettime_nsec_np), 1,000,000 of each, with kern.sweet_fast_abstime as it is.
  * MIT, as userland/.
  */
 #include <mach/mach.h>
@@ -181,10 +183,40 @@ static int threads(const char *arg)
 	return 0;
 }
 
+static void bench(void)
+{
+	enum { N = 1000000 };
+	int fast = -1;
+	size_t l = sizeof(fast);
+	volatile uint64_t sink = 0;
+
+	sysctlbyname("kern.sweet_fast_abstime", &fast, &l, NULL, 0);
+	printf("kern.sweet_fast_abstime %d\n", fast);
+	for (int pass = 0; pass < 2; pass++) {
+		double r0 = raw_ns(CLOCK_MONOTONIC_RAW);
+		for (int i = 0; i < N; i++)
+			sink += mach_absolute_time();
+		double r1 = raw_ns(CLOCK_MONOTONIC_RAW);
+		for (int i = 0; i < N; i++)
+			sink += mach_continuous_time();
+		double r2 = raw_ns(CLOCK_MONOTONIC_RAW);
+		for (int i = 0; i < N; i++)
+			sink += clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+		double r3 = raw_ns(CLOCK_MONOTONIC_RAW);
+		printf("pass %d: mach_absolute_time %.0f ns, mach_continuous_time %.0f ns, clock_gettime_nsec_np(UPTIME_RAW) "
+		    "%.0f ns per call\n", pass + 1, (r1 - r0) / N, (r2 - r1) / N, (r3 - r2) / N);
+	}
+	(void)sink;
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	mach_timebase_info(&tb);
+	if (argc > 1 && !strcmp(argv[1], "-b")) {
+		bench();
+		return 0;
+	}
 	if (argc > 2 && !strcmp(argv[1], "-t"))
 		return threads(argv[2]);
 	if (argc > 2 && !strcmp(argv[1], "-c")) {
