@@ -1,0 +1,101 @@
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -980,6 +980,55 @@
+ .endmacro
+ 
+ el0_synchronous_vector_64_long:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * 2026-11-27 (Claude): mach_absolute_time / mach_continuous_time without the full exception. With the 24 MHz
++	 * timebase (sweet_tb24, pexpert/arm/pe_identify_machine.c) EL0 cannot scale the counter itself, so every user
++	 * clock read is a mach trap (svc #0x80, x16 = -3 / -4): the whole user state saved and restored, ASTs, kdebug.
++	 * That was 12-19% of backboardd's samples while Control Center animated. Here the answer is made at the vector
++	 * and returned with eret: floor(CNTVCT * 5 / 4) as ml_get_hwclock() makes it, plus mach_absolutetime_asleep for
++	 * the continuous clock. Only while rtclock_base_abstime is 0 (cpu_timebase_init clears sweet_fast_abstime
++	 * otherwise: after a wake from sleep the kernel adds an offset). x0 is the answer; x1, the flags (SPSR) and
++	 * everything else come back unchanged; x16 is the trap number the stub set. sysctl kern.sweet_fast_abstime=0
++	 * sends these traps the long way again.
++	 */
++	stp		x0, x1, [sp, #-16]!
++	mrs		x0, ESR_EL1
++	lsr		w1, w0, #26
++	cmp		w1, #0x15					// ESR_EC_SVC_64
++	b.ne		Lsweet_fast_time_out
++	and		w1, w0, #0xffff
++	cmp		w1, #0x80					// svc #0x80
++	b.ne		Lsweet_fast_time_out
++	cmn		x16, #3						// MACH_ARM_TRAP_ABSTIME
++	b.eq		Lsweet_fast_time_ok
++	cmn		x16, #4						// MACH_ARM_TRAP_CONTTIME
++	b.ne		Lsweet_fast_time_out
++Lsweet_fast_time_ok:
++	adrp		x0, EXT(sweet_fast_abstime)@page
++	add		x0, x0, EXT(sweet_fast_abstime)@pageoff
++	ldr		w0, [x0]
++	cbz		w0, Lsweet_fast_time_out
++	adrp		x0, EXT(sweet_tb24)@page
++	add		x0, x0, EXT(sweet_tb24)@pageoff
++	ldr		w0, [x0]
++	cbz		w0, Lsweet_fast_time_out
++	isb							// non-speculative, as nonspeculative_timebase()
++	mrs		x0, CNTVCT_EL0
++	add		x0, x0, x0, lsr #2				// floor(hw * 5 / 4)
++	cmn		x16, #4
++	b.ne		Lsweet_fast_time_ret
++	adrp		x1, EXT(mach_absolutetime_asleep)@page
++	add		x1, x1, EXT(mach_absolutetime_asleep)@pageoff
++	ldr		x1, [x1]
++	add		x0, x0, x1
++Lsweet_fast_time_ret:
++	ldr		x1, [sp, #8]
++	add		sp, sp, #16
++	eret
++Lsweet_fast_time_out:
++	ldp		x0, x1, [sp], #16
++#endif
+ 	EL0_64_VECTOR	sync
+ 	EL0_64_VECTOR_SWITCH_TO_KERN_STACK
+ 	adrp	x1, EXT(fleh_synchronous)@page			// Load address for fleh
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -508,6 +508,8 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /* sweet: 1 = the mach timebase is the 19.2 MHz counter scaled to 24 MHz (pexpert/arm/pe_identify_machine.c) */
+ int sweet_tb24 = 0;
++/* 1 = the EL0 sync vector answers the clock traps itself (osfmk/arm64/locore.s); sysctl kern.sweet_fast_abstime */
++int sweet_fast_abstime = 1;
+ 
+ static inline uint64_t
+ sweet_tb_up(uint64_t hw)
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1025,6 +1025,15 @@
+ 	cdp->cpu_decrementer = 0x7FFFFFFFUL;
+ 	cdp->cpu_timebase = timebase_offset;
+ 	cdp->cpu_base_timebase = rtclock_base_abstime;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* the vector's clock-trap shortcut (locore.s) adds no base: only while there is none */
++		extern int sweet_fast_abstime;
++		if (rtclock_base_abstime != 0) {
++			sweet_fast_abstime = 0;
++		}
++	}
++#endif
+ }
+ 
+ int
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -121,6 +121,11 @@
+ #define PROF_CACHE_HI   0x300000000ull
+ #define PROF_VA_MASK    0x0000007fffffffffull
+ 
++/* 2026-11-27: the EL0 vector's clock-trap shortcut (osfmk/arm64/locore.s), 0 = every clock trap the long way */
++extern int sweet_fast_abstime;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fast_abstime, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fast_abstime, 0,
++    "1: mach_absolute_time / mach_continuous_time traps answered at the exception vector");
++
+ extern int sweet_profile_stacks(task_t task, uint64_t *out, int max_threads, int depth);
+ extern int sweet_profile_images(task_t task, uint64_t cache_lo, uint64_t cache_hi, char *s, int cap);
+ extern void sweet_profile_task_info(task_t task, uint64_t *slide, uint64_t *mh);
