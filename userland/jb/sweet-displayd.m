@@ -12,6 +12,8 @@
  *   sweet-displayd           run (launchd job com.sweet.displayd, or by hand in the background)
  *   sweet-displayd -v        also print every change
  *   sweet-displayd -1        print what iOS says once and exit (writes nothing)
+ * 2026-11-26: also mirrors iOS's Low Power Mode into sysctl kern.sweet_lowpower (kernel: capped CPU clocks, no touch
+ * boost, the UI at ~30 fps): powerd's notify state for com.apple.system.lowpowermode, or NSProcessInfo's flag.
  * MIT, as userland/.
  */
 #import <Foundation/Foundation.h>
@@ -25,6 +27,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <notify.h>
+#include <sys/sysctl.h>
 
 /* ---- the display controller (see dispcolor.c for the probe this rests on) ---- */
 #define MDP             0x0ae01000ull
@@ -170,6 +174,20 @@ static bool night_shift(bool *active, float *strength)
 	return ok;
 }
 
+/* iOS's Low Power Mode: 1 on, 0 off. Both sources; -1 prints them. */
+static int lpm_token = -1;
+static int low_power(int *from_notify, int *from_info)
+{
+	uint64_t state = 0;
+	if (lpm_token < 0 && notify_register_check("com.apple.system.lowpowermode", &lpm_token) != NOTIFY_STATUS_OK)
+		lpm_token = -2;
+	if (lpm_token >= 0)
+		(void)notify_get_state(lpm_token, &state);
+	*from_notify = state != 0;
+	*from_info = [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? 1 : 0;
+	return *from_notify || *from_info;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -194,6 +212,8 @@ int main(int argc, char **argv)
 			for (int i = 0; i < 40; i++)
 				printf("%s%02x", i % 4 ? "" : " ", last_status[i]);
 			printf("\n");
+			int fn = 0, fi = 0, lp = low_power(&fn, &fi);
+			printf("Low Power Mode %d (notify state %d, NSProcessInfo %d)\n", lp, fn, fi);
 			return 0;
 		}
 
@@ -203,9 +223,15 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		double last_r = -1, last_g = -1, last_b = -1;
-		int last_panel = -1;
+		int last_panel = -1, last_lp = -1;
 		for (;;) {
 			@autoreleasepool {
+				int fn = 0, fi = 0, lp = low_power(&fn, &fi);
+				if (lp != last_lp && sysctlbyname("kern.sweet_lowpower", NULL, NULL, &lp, sizeof(lp)) == 0) {
+					fprintf(stderr, "sweet-displayd: Low Power Mode %s (notify %d, NSProcessInfo %d)\n", lp ? "on" : "off",
+					    fn, fi);
+					last_lp = lp;
+				}
 				float level = BKSDisplayBrightnessGetCurrent ? BKSDisplayBrightnessGetCurrent() : 1.0f;
 				if (!(level >= 0 && level <= 1))
 					level = 1;

@@ -1,0 +1,28 @@
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -5675,11 +5675,21 @@
+ }
+ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
+ static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
++// supportsFamily: may ask repeatedly from the same framework call sites. Cache the RenderBox
++// classification by return PC so dladdr stays off that repeated capability-query path.
++static bool renderBoxCaller(const void *address) {
++ static std::atomic<uintptr_t> cache[32]{};
++ const uintptr_t pc=(uintptr_t)address;
++ const size_t slot=((pc>>2)^(pc>>11))%32;
++ const uintptr_t cached=cache[slot].load(std::memory_order_acquire);
++ if((cached&~uintptr_t(1))==pc)return (cached&1)!=0;
++ Dl_info caller{};
++ const bool isRenderBox=dladdr(address,&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/");
++ cache[slot].store(pc|(uintptr_t)isRenderBox,std::memory_order_release);
++ return isRenderBox;
++}
+ static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
+- if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 and up
+-  Dl_info caller;
+-  if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
+- }
++ if(family>=1003 && family<2000 && renderBoxCaller(__builtin_return_address(0)))return NO;
+  return gFamilyAnswer(self,_cmd,family);
+ }
+ // The base class keeps its limits in one plain structure inside the device object ([device limits] returns its address) and its own getters

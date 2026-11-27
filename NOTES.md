@@ -1,3 +1,161 @@
+# QoS governor + Low Power Mode pacing image (gov3, 2026-11-26)
+- Rebuilt iOS and macOS kernels from `work/xnu-12377` with the updated `xnu/ios27/xnu12377-lowpower.diff`: `kSweetFBSwapBegin` is paced to one frame per 33.3 ms with `IOSleep`, the vsync divider is absent, and the governor uses the 90% target without a low-power row cap (touch boost remains disabled in low-power mode). iOS kernel SHA-256 `d9f125f8ae476c7d1f30867082e6bb2801209f2f24f35fe16bb25cb150b64e32`; macOS kernel SHA-256 `59d7bfd6e092412b6f054d87abce33708dad9a7771a399062a4a173ef2e501aa` (plain arm64). Both contain the `kern.sweet_lowpower` description string. Build logs: `xnu12377-ios-gov3-build.log` and `work/xnu12377-macos27-gov3-build.log`. No compile errors or source fixes; existing warnings include `gov_thread` missing `noreturn` and reserved sysctl identifiers.
+- Packaged `outputs/guacamole-menu-gov3.img` with the fast-start ADT and shim. iOS/macOS boot args match fast-start except for refreshed `sweettime`; sidecars: `outputs/guacamole-menu-gov3-ios-boot-args.txt` (577 chars), `outputs/guacamole-menu-gov3-macos-boot-args.txt` (550 chars). Kernel provenance checks matched all 10 segments for both OS builds; ramdisk 42,457,600 / 48,234,496 bytes. Image SHA-256 `441039abfe4792b3ff322448f4d72f537f89380010e704dbe977f5fd7dca51cd`. Userland/plugin unchanged; phone untouched; no flash.
+
+# QoS governor + Low Power Mode image (2026-11-26)
+- Built both kernels from `work/xnu-12377` with `xnu/ios27/xnu12377-lowpower.diff` on top of the QoS governor sources. iOS: `BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet`, SHA-256 `80e1d0feafc9b7b9c2c9695d42df5325f6f88579f67662ad41a1b2bef6da7fa4`; macOS: `BUILD/obj-macos27-sweet/DEVELOPMENT_ARM64_SWEET/kernel.development.sweet`, SHA-256 `755f7c3ff246cc39a97af53a548af80eebd06e137287aac3b0e99944af6b3a8d` (plain arm64). Both contain `sweet_lowpower`; no source fixes were needed. Logs: `work/xnu12377-ios-gov2-build.log`, `work/xnu12377-macos27-gov2-build.log`. Existing XNU warnings remain, including reserved-identifier warnings and `gov_thread` missing `noreturn`; no errors.
+- Packaged `outputs/guacamole-menu-gov2.img` using the fast-start ADT and shim, with only `sweettime` refreshed in each OS's fast-start boot args. Sidecars: `outputs/guacamole-menu-gov2-ios-boot-args.txt` (577 chars) and `outputs/guacamole-menu-gov2-macos-boot-args.txt` (550 chars). Both kernels matched all 10 segments in `mkmenuboot.py`; ramdisk 42,457,440 / 48,234,496 bytes. Image SHA-256 `2bf547367aaf3da6490cad71f2136d874adf02dd70ccce5363335c071f89912b`. Fastboot: `fastboot flash boot_b outputs/guacamole-menu-gov2.img`.
+- Ran `sh userland/build.sh`; `sweet-displayd` compiled with the existing `jb/sweet-displayd-ents.plist` entitlements and signature verification passed. SHA-256 `d57d43bfeb02067aac9a41143e9152eebdbf908cb50c11b02eb177ee653c9786`. No `sweet-displayd.m` warnings; unrelated existing userland warnings remain in `mgtool.c`, `btuart.c`, `radio.c`, and `oslog.m`. Log: `userland-gov2-build.log`.
+- Built the iOS 27 NativeAdrenoMetal bundle from the current source, including `adrenometal-encode-timing-gate.diff` and `adrenometal-dladdr-cache.diff`, with `PATH=/private/tmp/adreno-cargo-bin:$PATH python3 scripts/build-adreno-metal-plugin.py --target ios27 --no-replay`. Strict deep signature verification passed; the executable SHA-256 is `ba78b263820527310e6e69ad5e874c92802f5365ff44826c09c6f550605b1136`, the Turnip dylib SHA-256 is `e5e36320f6d58c5873e79f3914175cc95ce457c697587c13397248e214a091d6`, and 4 KiB signature CDHash is `b34130de0687511856e2ac48e264862c01ba3dbd`. Package: `outputs/NativeAdrenoMetal-gov2.tar.gz`, SHA-256 `44064c3d88006373950cadd065b42775a0a1d98227863110a6321dc43c1668ae`. Build log: `work/UniXNU/build-gov2-plugin.log`. The `ld` duplicate `-lobjc` warning remains.
+- Phone untouched; no flash or install was run.
+
+# Backboardd encode hot-path review (2026-11-26)
+- Reviewed the Claude-provided `backboardd` profile (`outputs/prof-backboardd-named.txt`): 10,001 ms, 12,666 thread samples, 1.49 runnable threads/tick; the encode thread is 42.0% inclusive, indexed draw lowering 19.3%, `endEncoding` 8.9%, `_mach_absolute_time_kernel` 6.8%, and `_dladdr` 0.8%.
+- Applied two source changes in `work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm`, with separate review diffs `xnu/ios27/adrenometal-encode-timing-gate.diff` and `xnu/ios27/adrenometal-dladdr-cache.diff`. The first gates per-encode `TracedEncodeCall` clocks behind `SHENG_DIAG` plus opt-in `NATIVE_METAL_TIMING`; the second memoizes the RenderBox caller classification in `supportsFamily:`. Both patches passed sequential application to a temporary copy of the pre-change source. No plugin build or install was done.
+- `endEncoding` reaches `nmb_encoder_end` synchronously from the frontend encode closure. In the Rust runtime, a logged encoder can hand its end to the lowering worker and return; the local/inline path synchronously lowers and ends the render pass. Neither path itself waits for GPU completion. The aggregate profile does not retain the `_mach_msg2_trap` caller chain or Mach message arguments, and these end paths contain no explicit Mach RPC, so the destination and send/receive reply behavior are not identified by the supplied profile.
+- Exact draw counts per frame and identical full draw-state counts are not present in the profile. Source diagnostics can aggregate draw state-change masks (`/private/var/ngpu/debug/draw-stats`) and `NATIVE_METAL_DUMP_CB` groups consecutive draws by pipeline and depth state, but neither was captured here. No device/frame-rate measurements or build were done; phone untouched.
+
+# QoS placement and CPU-frequency governor image (2026-11-26)
+- Built iOS (`BUILD/obj-ios26-sweet`) and macOS (`BUILD/obj-macos27-sweet`) kernels from `work/xnu-12377` with
+  `xnu12377-qos-governor.diff` applied. `processor.c`, `sched_prim.c`, `sched_clutch.c`, `sweet_cpufreq.c`, and
+  `sweet_touch.c` compiled without errors; no source fixes were needed. Both kernels contain the QoS/governor
+  sysctl/log strings (9 matches each). Standard XNU and linker warnings remain. Logs:
+  `work/xnu12377-ios-gov1-build.log` and `work/xnu12377-macos27-gov1-build.log`.
+- Kernel SHA-256: iOS `4c506474ae5930887a88dab3405051a839c30f0cfe20a00d8a5a8b3f7a401694`; macOS
+  `691284a16fe64f18096de0c99d67b2edc0882efbdb737a63a7afd359a67383b4` (plain arm64).
+- Packaged `outputs/guacamole-menu-gov1.img` with the fast-start ADT, shim, and exact iOS/macOS boot arguments.
+  Sidecars: `outputs/guacamole-menu-gov1-ios-boot-args.txt` and
+  `outputs/guacamole-menu-gov1-macos-boot-args.txt`. `mkmenuboot.py` matched all 10 kernel segments per OS;
+  ramdisk 42,457,232 / 48,234,496 bytes. Image SHA-256
+  `cdff4e4ec5fb473747492f4506bb0ee218ff77eb4493f29546ffbc73dffc709c`.
+- Phone untouched; no commit.
+
+# Profiler 5: PMEM_MAP single log line (2026-11-26)
+- Rebuilt iOS (`BUILD/obj-ios26-sweet`) and macOS (`BUILD/obj-macos27-sweet`) kernels from `work/xnu-12377` with
+  the updated PMEM_MAP path (one map result log line, no `sweet_log_sync()` calls around mapping). Userland binaries
+  were not rebuilt. Kernel builds completed without errors or source fixes; standard XNU compiler/linker warnings
+  remain. Logs: `work/xnu12377-ios-profiler5-build.log` and `work/xnu12377-macos27-profiler5-build.log`.
+- Kernel SHA-256: iOS `9d8b343a6154d969ef0ac0a2f801d7ff0f7406930752a08e0492e3648ac9c505`; macOS
+  `d78de728f81785067379502feee4d30be79f4b13257c7167df5c50d612dab1ee` (plain arm64).
+- Packaged `outputs/guacamole-menu-profiler5.img` with the fast-start ADT, shim, and exact iOS/macOS boot args.
+  Sidecars: `outputs/guacamole-menu-profiler5-ios-boot-args.txt` and
+  `outputs/guacamole-menu-profiler5-macos-boot-args.txt`. `mkmenuboot.py` matched all 10 kernel segments per OS;
+  combined ramdisk 42,452,096 / 48,234,496 bytes. Image SHA-256
+  `7383fbc1f90213eabe0e059934130c38d5037b0ca54df5208e3db2b7ce8d01e1`.
+- Kept the latest userland binaries from the preceding build unchanged: wland
+  `0d2d494e9de3af55e293478f7536c1a85e56bfe4c73f3f80ee866afa771dddc4`, adspd
+  `5d2b5a2fb7f10484df7ee1991ce493cfbb7c594d8189bf321f395c2ad7478f71`, btbridge
+  `d51c44a7e6506ddf61dd90e137ed1c475ab98839e6f06f69a50c312ae3e81da4`. Phone untouched; no commit.
+
+# PMEM direct-access instruction-form rebuild (2026-11-26)
+- On branch `ios27`, ran `userland/build.sh` after `pmem.c` switched direct mapped device accesses to inline base-only
+  single-register loads/stores and excluded the apps SMMU window at `0x15000000`. Build completed with no errors;
+  existing warnings remain in unrelated `mgtool.c`, `btbridge.c`/included `btuart.c`, `radio.c`, and `oslog.m`.
+- Disassembly of `_pm_rd` / `_pm_wr` in `wland`, `adspd`, and `btbridge`: loads/stores through the mapped device
+  pointer are single-register `ldr wN, [xM]` / `str wN, [xM]` using base-only addressing. No pre-indexed,
+  post-indexed, or paired load/store forms access those mapped pointers. Post-indexed instructions in the copy loops
+  are on ordinary user buffers. Log: `userland-profiler4-pmem-asm-build.log`.
+- SHA-256: `userland/out/wland` `0d2d494e9de3af55e293478f7536c1a85e56bfe4c73f3f80ee866afa771dddc4`,
+  `userland/out/adspd` `5d2b5a2fb7f10484df7ee1991ce493cfbb7c594d8189bf321f395c2ad7478f71`,
+  `userland/out/btbridge` `d51c44a7e6506ddf61dd90e137ed1c475ab98839e6f06f69a50c312ae3e81da4`.
+- No kernel or image rebuild; `outputs/guacamole-menu-profiler4.img` remains unchanged at SHA-256
+  `b13200db6aafa2d673c7a8c78c0ced0d14d0b18d51606b0cbccc9f2b5f41111b`. Phone untouched; no commit.
+
+# Profiler 4: persistent console logging and PMEM bring-up log (2026-11-26)
+- Rebuilt iOS (`BUILD/obj-ios26-sweet`) and macOS (`BUILD/obj-macos27-sweet`) from `work/xnu-12377` with the
+  console logging change, profiler, PMEM windows, and PMEM_MAP. Ran `userland/build.sh` for the new `pm_direct_on()`
+  console + `kern.sweet_log_sync` trace. All builds completed without compile errors or source fixes; standard
+  XNU warnings remain. Logs: `work/xnu12377-ios-profiler4-build.log`, `work/xnu12377-macos27-profiler4-build.log`,
+  and `userland-profiler4-build.log`.
+- Kernel SHA-256: iOS `577823610acbc5d9a8826cb5f24885a4fbcd32443a5fab681190abd6e7a96bc9`; macOS
+  `47e2ae4be3a26c47086375643825f9544b3550784388c22d9a23da320f454905` (plain arm64).
+- Packaged `outputs/guacamole-menu-profiler4.img` with the fast-start ADT, shim, and exact iOS/macOS boot args.
+  Sidecars: `outputs/guacamole-menu-profiler4-ios-boot-args.txt` and
+  `outputs/guacamole-menu-profiler4-macos-boot-args.txt`. `mkmenuboot.py` matched all 10 kernel segments for each
+  OS. Combined ramdisk 42,452,096 / 48,234,496 bytes. Image SHA-256
+  `b13200db6aafa2d673c7a8c78c0ced0d14d0b18d51606b0cbccc9f2b5f41111b`.
+- Userland SHA-256: `userland/out/wland` `2643b7555a873c9023f0cd533a9ede0fd607ab728984669af3df4ef3b2133f97`,
+  `userland/out/adspd` `40c79e418c6fc359cf050b2f7350b1648dafacb293eaf444d07d7ccdf9a6c0c6`,
+  `userland/out/btbridge` `3344f008dd09acb734204fe5f374c03833326960a389cbd6c90b1ddf563d536e`.
+- Phone untouched; no commit.
+
+# PMEM direct-mode bring-up gate userland rebuild (2026-11-26)
+- On branch `ios27`, ran `userland/build.sh` after the `pm_direct_on()` changes in `wland`, `adspd`, and `btbridge`.
+  The build completed with no errors. It emitted existing warnings in `mgtool.c` (deprecated `CC_MD5`), `btbridge.c`
+  (unused included `btuart` helpers), `radio.c` (operator parentheses), and `oslog.m` (unused parameter).
+- SHA-256: `userland/out/wland` `8c354e77a97b6503410e2a7c45c0f5098952bc17ccec8e9220e9874a07614ab3`,
+  `userland/out/adspd` `8a605278e89b0771832a1817312eaa0b4734e90a7ec55af0d65efae2d4df4182`,
+  `userland/out/btbridge` `87f3961e8783073f215693dfa00f28142986c5fbb8150dc988ae8438addeb7c4`.
+- No kernel or boot image rebuild. `outputs/guacamole-menu-profiler3.img` remains unchanged at SHA-256
+  `ffc48dd1211e2c407d8a535d4f7ca0f65765235e0fec5e1b916455c8a5b23778`. Phone untouched; no commit.
+
+# Profiler + PMEM map low-address guard rebuild (2026-11-26)
+- Rebuilt iOS from `work/xnu-12377` with the iPhoneOS SDK into `BUILD/obj-ios26-sweet`, macOS with
+  `tools/mkmacos27kernel.sh` into `BUILD/obj-macos27-sweet`, and the requested userland tools with
+  `userland/build.sh`. The current PMEM_MAP code refuses physical addresses below `0x100000`; userland maps the
+  first 2 MiB window starting at `0x100000`, keeps direct mode opt-in via `PMEM_DIRECT=1`, and `pmemtest -m`
+  maps without reading. Build logs: `work/xnu12377-ios-profiler3-build.log`,
+  `work/xnu12377-macos27-profiler3-build.log`, and `userland-profiler3-build.log`. All builds succeeded; no
+  compile fixes were needed. Kernel compiler warnings remain (including reserved-identifier/cast-alignment warnings
+  in `sweet_pmem.c` and linker segment-order warnings).
+- Kernel SHA-256: iOS `1c06e3af432bf1036cb6852496756d517a6fb7b51c44755897212673860fcdcf`; macOS
+  `4321d76ea5493feea4005a451ab45ca0cc1168b2b17fa6635af85b2268afee54` (plain arm64).
+- Packaged `outputs/guacamole-menu-profiler3.img` with the fast-start ADT, shim, and exact iOS/macOS boot args.
+  Sidecars: `outputs/guacamole-menu-profiler3-ios-boot-args.txt` and
+  `outputs/guacamole-menu-profiler3-macos-boot-args.txt`. `mkmenuboot.py` matched all 10 kernel segments for each
+  OS build. Combined ramdisk is 42,452,096 / 48,234,496 bytes. Image SHA-256
+  `ffc48dd1211e2c407d8a535d4f7ca0f65765235e0fec5e1b916455c8a5b23778`.
+- Userland SHA-256: `userland/out/pmemtest` `3506f29f4397b9d97d526264f2a5962bff9134800fe7ba0cc62a0aacbb895325`,
+  `userland/out/wland` `f9e2cb9d4922bf0ea3a00ef1524df6ea3403e3346680205518f27e11136b922f`,
+  `userland/out/adspd` `7968dfa61a8d50a5b3f70dd9f5f2fdb9ca6c7c9351dc5c0ced03677304a7e212`,
+  `userland/out/btbridge` `4f0ca6cd24090c8a92091e6e4f4dd7e222d25d2dba00f63e9cec108d7429a595`.
+- Phone untouched; no commit.
+
+# Profiler + PMEM map logging rebuild (2026-11-26)
+- Rebuilt the iOS kernel from `work/xnu-12377` with the iPhoneOS SDK into `BUILD/obj-ios26-sweet`, and rebuilt
+  macOS with `tools/mkmacos27kernel.sh` into `BUILD/obj-macos27-sweet`. Both include the current profiler, PMEM
+  windows, and PMEM_MAP changes, including before/after map logging, `sweet_log_sync()`, and
+  `kern.sweet_log_sync`. Build logs: `work/xnu12377-ios-profiler2-build.log` and
+  `work/xnu12377-macos27-profiler2-build.log`. Both builds succeeded without compile errors; no source fix was
+  needed. The kernel sources emitted compiler warnings, including reserved-identifier and cast-alignment warnings
+  in `sweet_pmem.c`, plus the usual linker segment-order warnings.
+- Kernel SHA-256: iOS `a9fd440473d288ae7f73b62ab00bc1e7428cfe036a140d8df17a6363b0604308`; macOS
+  `486c741548844685eed3b74849223dfbc536b1511b13e7fe74e852ab560b3868` (plain arm64).
+- Packaged `outputs/guacamole-menu-profiler2.img` with the fast-start ADT (`work/guacamole-ios27a-yuv.adt`,
+  SHA-256 `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`), current shim, and the exact
+  iOS/macOS boot-argument sidecars from `guacamole-menu-fast-start.img`. Packager provenance checks matched all
+  10 kernel segments for each OS. Combined ramdisk: 42,452,096 / 48,234,496 bytes. Image size 50,229,248 bytes;
+  SHA-256 `c1011d085a3773b6387e5adda01373f373293a84aea9b0ccab253c7c1df65229`.
+- Ran `userland/build.sh` (`userland-profiler2-build.log`), which completed successfully. SHA-256:
+  `userland/out/pmemtest` `96ef1389f95321a45a193cf4cda6604a23d20fbeddccef36b52a207164d72c12`,
+  `userland/out/wland` `e4c05a8fe3804977a414b8e7ccbe092b12b078afc93ab506fe5af7e2cdfcd798`,
+  `userland/out/adspd` `bd421aff28e3f537c88749126ca9831478e1b33c6e588523aca51cfdf37fd7f7`,
+  `userland/out/btbridge` `7dc47716f1ce62b42f707ba2014fb02c6f94773a7de8453b3c72002bce2f9754`.
+- Phone untouched; no commit.
+
+# Profiler + PMEM map kernel/menu and userland rebuild (2026-11-26)
+- Rebuilt iOS (`BUILD/obj-ios26-sweet`) and macOS (`BUILD/obj-macos27-sweet`) kernels from `work/xnu-12377` with profiler, PMEM windows, and PMEM_MAP. `SweetPlatformExpert.cpp` needed one compile-only correction: use `p == NULL` in place of the unavailable `PROC_NULL` macro in this translation unit; same null-process behavior. Both final builds succeeded without compile errors. Logs: `xnu12377-ios-profiler-pmemmap-build.log`, `work/xnu12377-macos-profiler-pmemmap-build.log`.
+- iOS kernel SHA-256 `66a96b74bcdc5b741ce3384427e77f63a5794bffa4e5a45fdf37098b0f87ce91`; macOS kernel SHA-256 `ddf08d799c818bc9b3ccc65b0f6304d2621b8e52e3420a868c319ad5df19074c`. Both retain `sweet_profile` and `sweet_pmem_stats`.
+- Repacked `outputs/guacamole-menu-profiler.img` with the same ADT, shim, and exact boot arguments as `guacamole-menu-fast-start.img`; sidecars are `outputs/guacamole-menu-profiler-ios-boot-args.txt` and `outputs/guacamole-menu-profiler-macos-boot-args.txt`. Image SHA-256 `1040308501d2c4d60b95d90b1e330cf41b83c88ea358addd7658e3e51fda98fb`; ramdisk 42,451,888 bytes, below the 46 MiB limit. Provenance checks passed for both OS kernels.
+- Rebuilt iOS PMEM-linked userland binaries with `userland/build.sh`: `wland` `a380ec1f738d5965377f2420c42b6fb81b5b683a651c7587fe92049061e222dd`; `adspd` `d6b793aa73a098164adc7269414de43deb13540e50e2ac69775d1addbace1a78`; `btbridge` `225ec5a06af1c844692d4d8a6570a0b84fa5c0b40bdc019f31394e6ff68e683c`; `tfa` `cbc9fbfebbac118f1aec6cc663f6d10c2f620a108bd6238af14a28d7c16e3f19`; `btprobe` `0ff971533e24701394b89581aa4e9f5fffbd3221b921606fc7ea63e3c6ed8527`; `btuart` `600fa066ba9658ae9359cc1ec215b1450a3e1d4bb9be3702672fc4b54e1fc3a2`. The macOS build script supports `wland` (`cc92c74ca53050f17fa0b0099499d755612d964aeda9e99ff88cc6256da6f621`) and `btbridge` (`c438ad8694ee2646e2e972bf36e74c2f2b5ec9ac6ba1a0e03f636df2800dd01c`); it does not build macOS `adspd`, `tfa`, `btprobe`, or `btuart`. Logs: `userland-profiler-pmemmap-build.log`, `work/macos27-wt/userland-macos-profiler-pmemmap-build.log`. No userland compile errors. Phone untouched; no commit.
+
+# Profiler + PMEM windows kernel/menu image (2026-11-26)
+- Built both kernels from `work/xnu-12377`: iOS with the iPhoneOS SDK into `BUILD/obj-ios26-sweet`, and macOS with `tools/mkmacos27kernel.sh` into `BUILD/obj-macos27-sweet`. Included `xnu/ios27/xnu12377-profiler.diff` and the added `xnu/ios27/xnu12377-pmem-windows.diff` source changes. Build logs: `xnu12377-ios-profiler-build.log` and `work/xnu12377-macos-profiler-build.log`. Both builds completed without compile errors after one declaration-only fix in `bsd/dev/sweet_sample.c`: explicitly declared `thread_terminate(thread_t)`; cleanup logic is unchanged.
+- Both kernels contain `kern.sweet_profile` and `kern.sweet_pmem_stats`. iOS kernel SHA-256 `65dbc2225b89ae6d426e551a27e398f9d9fd6ee20f30041ebb95d9f667dee9be`; macOS kernel SHA-256 `b311e5ae78928dd36d7913f2a5051d40cd8600a8029adfdcbc3cb44e0eac8e9a`.
+- Packaged `outputs/guacamole-menu-profiler.img` with the fast-start ADT, shim, and exact iOS/macOS boot arguments. Sidecars: `outputs/guacamole-menu-profiler-ios-boot-args.txt` and `outputs/guacamole-menu-profiler-macos-boot-args.txt`. Image size 50,229,248 bytes; SHA-256 `15a8ee2ffc1a95e355256b68cd4c74e3b0e7267732b6ed1e7c13aa903011f101`. Packager verified both payload kernels against their OS-specific build directories and accepted the 42,451,744-byte combined ramdisk (under 46 MiB). Phone untouched; no commit.
+
+# Fast-start kernel/menu build (2026-11-26)
+- Rebuilt iOS from `work/xnu-12377` using the iPhoneOS SDK and `BUILD/obj-ios26-sweet`; rebuilt macOS with
+  `tools/mkmacos27kernel.sh` into `BUILD/obj-macos27-sweet`. Logs: `work/xnu12377-ios-fast-start-build.log` and
+  `work/xnu12377-macos27-fast-start-build.log`. Both builds succeeded; no compile errors, including in
+  `bsd/dev/sweet_gpu.c` (`vfs_rootvnode()` / `NULLVP`).
+- Packaged `outputs/guacamole-menu-fast-start.img` using the exact ADT bytes, shim, and iOS/macOS boot-argument
+  strings from `outputs/guacamole-menu-shared-resp.img` and its part images. The ADT SHA-256 is
+  `5497611403f3a306e797c9f48d0ccbea50469bc767fe9b4d503727dc30a67ad1`; boot args are in the new `*-ios-boot-args.txt`
+  and `*-macos-boot-args.txt` sidecars. Image SHA-256: `68036e610554eb68d71e8ff736868c988be71116f20160b86e4614ef496c87e5`.
+- iOS kernel SHA-256: `28cbf2aa70c278798073019204dd0f9787885378846286ba75800f9d7319932a`; macOS kernel SHA-256:
+  `c30d76b4c7c1db67d84e89c8f53b21f470f7d6685a194d45b40ff8973854694e`. Not flashed; no commit.
+
 # Shared-tree iOS touchfix quiet image (2026-11-23)
 - Built the iOS kernel from `work/xnu-12377` with the iOS SDK and `BUILD/obj-ios26-sweet`; `work/xnu-ios27` was not
   used. Kernel SHA-256: `bcb9d3f5a2eca495ed30fe7153b6429a148e6da437af45760231f529a7892853`.

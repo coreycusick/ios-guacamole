@@ -1,0 +1,20 @@
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -225,6 +225,8 @@
+ // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
+ // with SHENG_DIAG set, which the plugin sets from the boot argument diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+ static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
++// Per-encode timing is opt-in: each clock read traps on SWEET TB24. Keep diag tracing available, but only wrap every encoder call when explicitly requested.
++static bool encodeTimingOn() {static const bool on=diagOn() && getenv("NATIVE_METAL_TIMING")!=nullptr;return on;}
+ static uint32_t threadCpuUs() {
+  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+  if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+@@ -2544,7 +2546,7 @@
+  }
+ };
+ template<class F> static void encodeLater(F &&work,const char *label,uint32_t line,uint64_t command) {
+- if(!diagOn()){encodeLaterRaw(std::forward<F>(work));return;}
++ if(!encodeTimingOn()){encodeLaterRaw(std::forward<F>(work));return;}
+  using Closure=std::decay_t<F>;
+  encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
+                 ++gDetailSequence,command,0,nowUs()});
