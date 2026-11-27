@@ -99,6 +99,13 @@ BUI="$R/System/Library/PreferenceBundles/BatteryUsageUI.bundle/BatteryUsageUI"
 sudo python3 "$TOOLS/patch-bui-battauth.py" "$BUI" /tmp/ios27-BUI.new
 sudo sh -c 'cat /tmp/ios27-BUI.new > "$1"' _ "$BUI"	# keeps owner, mode, hard links
 sudo rm -f /tmp/ios27-BUI.new
+# wifid (WiFiPolicy is built in): its auto-join RSSI threshold for this phone is above any real signal, so a known
+# network at -47 dBm was refused ("Below minimum RSSI threshold") and Wi-Fi never joined by itself. One branch
+# (tools/patch-wifid-ajrssi.py: b.lt -> nop); the scan's own -80 dBm minimum still applies. 2026-11-27.
+WD="$R/usr/sbin/wifid"
+sudo python3 "$TOOLS/patch-wifid-ajrssi.py" "$WD" /tmp/ios27-wifid.new
+sudo sh -c 'cat /tmp/ios27-wifid.new > "$1"' _ "$WD"	# keeps owner, mode, hard links
+sudo rm -f /tmp/ios27-wifid.new
 # launchd.plist: no FairPlay here; com.apple.fairplayd.H2 exits -42306 and KeepAlive restarts it forever.
 # 2026-11-19: com.apple.cameracaptured goes too: the synthetic camera kept restarting it (about 400 MB of GPU pool,
 # then a jetsam kill, every few seconds), which resprung SpringBoard when leaving a game. backboardd gets
@@ -298,6 +305,11 @@ if [ -f "$MB/NativeAdrenoMetal" ] && [ -f "$MB/libvulkan_freedreno.dylib" ]; the
 	sudo find "$ext/NativeAdrenoMetal.bundle" -type d -exec chmod 0755 {} \;
 	sudo find "$ext/NativeAdrenoMetal.bundle" -type f -exec chmod 0644 {} \;
 	sudo chmod 0755 "$ext/NativeAdrenoMetal.bundle/NativeAdrenoMetal" "$ext/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib"
+	# 2026-11-27: lower their PAC instructions (blraaz, retab, xpaci, ...) as the system's code was: the Kryo 485 has no
+	# FEAT_PAuth, so each one trapped into the kernel's emulation (sleh.c) -- every Metal/Vulkan call and return.
+	# NativeAdrenoMetal ~2,900 words, libvulkan_freedreno ~11,500. Settings scrolling 37-39 -> 55-57 fps. Idempotent.
+	sudo python3 "$TOOLS/pac/lower-macho.py" "$ext/NativeAdrenoMetal.bundle/NativeAdrenoMetal" \
+		"$ext/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib"
 	sudo install -o 0 -g 0 -m 0644 /dev/null "$ext/NativeAdrenoMetal.publish"
 	echo "GPU: NativeAdrenoMetal.bundle from $MB ($(shasum -a 256 "$MB/NativeAdrenoMetal" | cut -c1-16))"
 else
