@@ -1,0 +1,162 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2619,23 +2619,34 @@
+  * Untouched: 0xf0000000 (zap metadata), 0xfd800000.. (adspd's FastRPC heap, buffers, PCM), the cont-splash region.
+  * Boot-arg sweetgpuhigh=0 takes the first (high) range away.
+  */
+-static const struct { uint64_t start, end; } gpu_pool_ranges[] = {
++/*
++ * 2026-11-25 (hotdogg prep): the ranges come from ADT /sweet-gpu pool-ranges (u64 start, end pairs, written by
++ * mkadt.py for boards other than guacamole); without that property the guacamole table below is used, so a
++ * guacamole ADT behaves exactly as before. Ranges must be 64 KB aligned; the first one is the "high" range that
++ * sweetgpuhigh=0 takes away. A bad property is ignored (the defaults are used) and logged.
++ */
++struct gpu_pool_range { uint64_t start, end; };
++static const struct gpu_pool_range gpu_pool_default[] = {
+ 	{ 0x240000000ull, 0x280000000ull },
+ 	{ 0xc4000000ull, 0xe0000000ull },
+ 	{ 0xe1000000ull, 0xf0000000ull },
+ 	{ 0xace00000ull, 0xbbb00000ull },
+ 	{ 0xa0000000ull, 0xa4c00000ull },
+ };
+-#define GPU_POOL_RANGES   (sizeof(gpu_pool_ranges) / sizeof(gpu_pool_ranges[0]))
+-#define GPU_POOL_CHUNKS   ((0x40000000ull + 0x1c000000ull + 0x0f000000ull + 0x0ed00000ull + 0x04c00000ull) / GPU_POOL_CHUNK)
+-static uint8_t gpu_pool_used[GPU_POOL_CHUNKS];
+-static uint64_t gpu_pool_free_bytes = GPU_POOL_CHUNKS * GPU_POOL_CHUNK;
++#define GPU_POOL_MAX_RANGES 8
++#define GPU_POOL_MAX_BYTES  0x100000000ull      /* 4 GiB: 64 KB of chunk map */
++#define GPU_POOL_MAX_CHUNKS (GPU_POOL_MAX_BYTES / GPU_POOL_CHUNK)
++static struct gpu_pool_range gpu_pool_ranges[GPU_POOL_MAX_RANGES];
++static unsigned gpu_pool_nranges;
++static uint64_t gpu_pool_nchunks;               /* 0 until gpu_pool_setup */
++static uint8_t gpu_pool_used[GPU_POOL_MAX_CHUNKS];
++static uint64_t gpu_pool_free_bytes;
+ static bool gpu_pool_ready;
+ 
+ static uint64_t
+ gpu_pool_pa(uint64_t chunk)
+ {
+-	for (unsigned r = 0; r < GPU_POOL_RANGES; r++) {
++	for (unsigned r = 0; r < gpu_pool_nranges; r++) {
+ 		uint64_t n = (gpu_pool_ranges[r].end - gpu_pool_ranges[r].start) / GPU_POOL_CHUNK;
+ 		if (chunk < n) {
+ 			return gpu_pool_ranges[r].start + chunk * GPU_POOL_CHUNK;
+@@ -2645,6 +2656,40 @@
+ 	return 0;
+ }
+ 
++/* ADT /sweet-gpu pool-ranges into gpu_pool_ranges; false (nothing changed) if absent or unusable */
++static bool
++gpu_pool_from_adt(void)
++{
++	DTEntry node;
++	void const *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "pool-ranges", &prop, &size) != kSuccess) {
++		return false;
++	}
++	unsigned n = size / 16;
++	if (size == 0 || size % 16 || n > GPU_POOL_MAX_RANGES) {
++		printf("SWEET GPU: /sweet-gpu pool-ranges has %u bytes: ignored\n", size);
++		return false;
++	}
++	struct gpu_pool_range r[GPU_POOL_MAX_RANGES];
++	uint64_t total = 0;
++	for (unsigned i = 0; i < n; i++) {
++		memcpy(&r[i].start, (const uint8_t *)prop + 16 * i, 8);
++		memcpy(&r[i].end, (const uint8_t *)prop + 16 * i + 8, 8);
++		if (r[i].end <= r[i].start || (r[i].start | r[i].end) % GPU_POOL_CHUNK ||
++		    r[i].end - r[i].start > GPU_POOL_MAX_BYTES - total) {
++			printf("SWEET GPU: /sweet-gpu pool-ranges entry %u %#llx-%#llx unusable: ignored\n", i,
++			    (unsigned long long)r[i].start, (unsigned long long)r[i].end);
++			return false;
++		}
++		total += r[i].end - r[i].start;
++	}
++	memcpy(gpu_pool_ranges, r, n * sizeof(r[0]));
++	gpu_pool_nranges = n;
++	return true;
++}
++
+ /* With gpu_be_lock held: once, sweetgpuhigh=0 takes the last range away */
+ static void
+ gpu_pool_setup(void)
+@@ -2653,6 +2698,16 @@
+ 		return;
+ 	}
+ 	gpu_pool_ready = true;
++	bool adt = gpu_pool_from_adt();
++	if (!adt) {
++		memcpy(gpu_pool_ranges, gpu_pool_default, sizeof(gpu_pool_default));
++		gpu_pool_nranges = sizeof(gpu_pool_default) / sizeof(gpu_pool_default[0]);
++	}
++	gpu_pool_nchunks = 0;
++	for (unsigned r = 0; r < gpu_pool_nranges; r++) {
++		gpu_pool_nchunks += (gpu_pool_ranges[r].end - gpu_pool_ranges[r].start) / GPU_POOL_CHUNK;
++	}
++	gpu_pool_free_bytes = gpu_pool_nchunks * GPU_POOL_CHUNK;
+ 	uint32_t high = 1;
+ 	(void)PE_parse_boot_argn("sweetgpuhigh", &high, sizeof(high));
+ 	uint64_t n = (gpu_pool_ranges[0].end - gpu_pool_ranges[0].start) / GPU_POOL_CHUNK;
+@@ -2660,8 +2715,8 @@
+ 		memset(&gpu_pool_used[0], 1, n);
+ 		gpu_pool_free_bytes -= n * GPU_POOL_CHUNK;
+ 	}
+-	printf("SWEET GPU: pool %llu MB in %u ranges%s\n", gpu_pool_free_bytes >> 20, (unsigned)GPU_POOL_RANGES,
+-	    high ? " (with 1 GB above XNU)" : "");
++	printf("SWEET GPU: pool %llu MB in %u ranges from %s%s\n", gpu_pool_free_bytes >> 20, gpu_pool_nranges,
++	    adt ? "the ADT" : "the guacamole table", high ? "" : " (sweetgpuhigh=0: first range off)");
+ }
+ 
+ int
+@@ -2673,7 +2728,7 @@
+ 	}
+ 	lck_mtx_lock(gpu_be_lock);
+ 	gpu_pool_setup();
+-	for (uint64_t c = 0; c < GPU_POOL_CHUNKS; c++) {
++	for (uint64_t c = 0; c < gpu_pool_nchunks; c++) {
+ 		/* a buffer must not straddle two ranges */
+ 		if (gpu_pool_used[c] || (run != 0 && gpu_pool_pa(c) != gpu_pool_pa(c - 1) + GPU_POOL_CHUNK)) {
+ 			run = 0;
+@@ -2701,9 +2756,9 @@
+ {
+ 	uint64_t n = (bytes + GPU_POOL_CHUNK - 1) / GPU_POOL_CHUNK;
+ 	lck_mtx_lock(gpu_be_lock);
+-	for (uint64_t c = 0; c < GPU_POOL_CHUNKS && n; c++) {
++	for (uint64_t c = 0; c < gpu_pool_nchunks && n; c++) {
+ 		if (gpu_pool_pa(c) == pa) {
+-			for (; n && c < GPU_POOL_CHUNKS; n--, c++) {
++			for (; n && c < gpu_pool_nchunks; n--, c++) {
+ 				gpu_pool_used[c] = 0;
+ 				gpu_pool_free_bytes += GPU_POOL_CHUNK;
+ 			}
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -28,6 +28,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+ #include <IOKit/IOLib.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+@@ -431,6 +432,18 @@
+ 	IOLog("SWEET CHARGE: input current control %s\n", fCharge ? "on" : "off (sweetcharge=1 turns it on)");
+ 	if (fKind == 2) {
+ 		fDesign = 4000;         /* OnePlus 7 Pro: 4000 mAh (no capacity in its DT) */
++		/* 2026-11-25: other boards give theirs in ADT /sweet-board battery-design-mah (mkadt.py; hotdogg 4085) */
++		if (IORegistryEntry *board = IORegistryEntry::fromPath("/sweet-board", gIODTPlane)) {
++			OSData *d = OSDynamicCast(OSData, board->getProperty("battery-design-mah"));
++			if (d && d->getLength() == sizeof(UInt32)) {
++				UInt32 mah = *(const UInt32 *)d->getBytesNoCopy();
++				if (mah >= 1000 && mah <= 10000) {
++					fDesign = mah;
++				}
++			}
++			board->release();
++		}
++		IOLog("SWEET BATTERY: design capacity %u mAh\n", fDesign);
+ 	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
