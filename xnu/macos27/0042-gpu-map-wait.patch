@@ -1,0 +1,137 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1963,6 +1963,49 @@
+ /* On-demand L2/L3 tables for CB1, carved from contiguous pages. */
+ static uint64_t be_l3_pa[GVA_USER_END >> 21];      /* 0 = none; one L3 covers 2 MB */
+ static vm_offset_t be_l3_kva[GVA_USER_END >> 21];  /* kernel VA of that L3 page */
++/*
++ * 2026-11-27 (Claude): the L3 tables written since the last flush (one bit per 2 MB slot). redwood_gpu_mapped() cleaned
++ * every L3 table that exists (a loop over 32768 slots and 4 KB of cache clean per table, after each 1024-page piece of
++ * every BoMap); tables are never freed, so the cost grew with every address ever mapped. Turnip's BoMap was 3.8% of
++ * backboardd in a Control Center profile. Now only the tables written are cleaned.
++ */
++static uint64_t be_l3_dirty[(GVA_USER_END >> 21) / 64];
++static unsigned be_l3_dirty_lo = ~0u, be_l3_dirty_hi;
++
++static void
++be_l3_mark(uint64_t va)
++{
++	unsigned slot = (unsigned)(va >> 21);
++	be_l3_dirty[slot / 64] |= 1ull << (slot % 64);
++	if (slot < be_l3_dirty_lo) {
++		be_l3_dirty_lo = slot;
++	}
++	if (slot > be_l3_dirty_hi) {
++		be_l3_dirty_hi = slot;
++	}
++}
++
++/* clean the written L3 tables to memory (the SMMU's walks do not snoop) */
++static void
++be_l3_clean(void)
++{
++	if (be_l3_dirty_lo > be_l3_dirty_hi) {
++		return;
++	}
++	for (unsigned w = be_l3_dirty_lo / 64; w <= be_l3_dirty_hi / 64; w++) {
++		uint64_t bits = be_l3_dirty[w];
++		be_l3_dirty[w] = 0;
++		while (bits) {
++			unsigned s = w * 64 + (unsigned)__builtin_ctzll(bits);
++			bits &= bits - 1;
++			if (be_l3_pa[s]) {
++				flush_dcache64((addr64_t)be_l3_kva[s], 0x1000u, FALSE);
++			}
++		}
++	}
++	be_l3_dirty_lo = ~0u;
++	be_l3_dirty_hi = 0;
++}
+ /* 0144: the L2 table of each GB of GPU VA (TCR T0SZ 32: four L1 entries); [0] is the stage-7 one */
+ static uint64_t *be_l2[GVA_USER_END >> 30];
+ 
+@@ -2106,6 +2149,7 @@
+ 	}
+ 	t[(address >> 12) & 0x1ffu] = (phys & ~0xfffull) | PTE_AF | PTE_SH_OS | PTE_AP_UNPRIV |
+ 	    (read_only ? PTE_AP_RO : 0) | PTE_PAGE;
++	be_l3_mark(address);
+ 	be_tables_dirty = true;
+ 	return true;
+ }
+@@ -2124,11 +2168,7 @@
+ {
+ 	if (be_tables_dirty) {
+ 		be_tables_dirty = false;
+-		for (unsigned s = 0; s < (GVA_USER_END >> 21); s++) {
+-			if (be_l3_pa[s]) {
+-				flush_dcache64((addr64_t)be_l3_kva[s], 0x1000u, FALSE);
+-			}
+-		}
++		be_l3_clean();
+ 		be_tlb_flush();
+ 	}
+ }
+@@ -2140,8 +2180,10 @@
+ 		uint64_t *t = be_l3_for(address + off, false);
+ 		if (t != NULL) {
+ 			t[((address + off) >> 12) & 0x1ffu] = 0;
++			be_l3_mark(address + off);
+ 		}
+ 	}
++	be_l3_clean();          /* 2026-11-27: the cleared entries reach memory before the TLB forgets the old ones */
+ 	be_tlb_flush();
+ }
+ 
+@@ -2897,6 +2939,8 @@
+ 	return fence;
+ }
+ 
++extern int get_preemption_level(void);   /* osfmk/arm/cpu_data.h */
++
+ /* 0 when the fence has passed; ETIMEDOUT after timeout_ns (0: just look) */
+ int
+ sweet_gpu_wait_fence_ns(uint32_t fence, uint64_t timeout_ns)
+@@ -2913,7 +2957,19 @@
+ 			return ETIMEDOUT;
+ 		}
+ 		if (spin < 64) {
+-			delay(20);                      /* most fences pass within a frame: look often first */
++			/*
++			 * Most fences pass within a frame: look often first. 2026-11-27 (Claude): a timed sleep, not delay(20),
++			 * which spun (20 us is under the CPU's idle latency): up to 1.3 ms of CPU per wait, 2.8% of backboardd
++			 * in a Control Center profile. Same 64 looks, the CPU free in between.
++			 */
++			if (get_preemption_level() != 0 || !ml_get_interrupts_enabled()) {
++				delay(20);              /* a caller that may not block keeps the spin */
++			} else {
++				uint64_t until;
++				clock_interval_to_deadline(50, NSEC_PER_USEC, &until);
++				assert_wait_deadline((event_t)&sweet_gpu_wait_fence_ns, THREAD_UNINT, until);
++				thread_block(THREAD_CONTINUE_NULL);
++			}
+ 		} else {
+ 			IOSleep(1);
+ 		}
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -730,14 +730,17 @@
+ 		for (uint64_t off = 0; r == kIOReturnSuccess && off < bo->bytes;) {
+ 			uint32_t n = 0;
+ 			uint64_t start = off;
+-			for (; n < SWEET_V2_PAGEBUF && off < bo->bytes; n++, off += 4096) {
++			/* 2026-11-27: each physical segment once, then its 4K pages (a pool buffer is one segment) */
++			while (n < SWEET_V2_PAGEBUF && off < bo->bytes) {
+ 				IOByteCount seg = 0;
+ 				addr64_t pa = bo->md->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-				if (pa == 0 || (pa & 4095)) {
++				if (pa == 0 || (pa & 4095) || seg < 4096) {
+ 					r = kIOReturnVMError;
+ 					break;
+ 				}
+-				fPageBuf[n] = pa;
++				for (; seg >= 4096 && n < SWEET_V2_PAGEBUF && off < bo->bytes; n++, off += 4096, pa += 4096, seg -= 4096) {
++					fPageBuf[n] = pa;
++				}
+ 			}
+ 			if (r == kIOReturnSuccess && sweet_gpu_map_at(rq->iova + start, fPageBuf, n)) {
+ 				r = kIOReturnNoResources;

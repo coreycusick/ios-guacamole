@@ -1,0 +1,96 @@
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -31,6 +31,8 @@
+  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
+  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+  */
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <kern/kalloc.h>
+ #include <kern/locks.h>
+ #include <libkern/libkern.h>
+@@ -43,6 +45,7 @@
+ #include <sys/redwood_sta.h>
+ #include <sys/sockio.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ 
+ #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
+ #define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
+@@ -240,6 +243,39 @@
+ 	       request->req_len);
+ }
+ 
++/*
++ * 2026-11-27 (Claude): iOS 27.2's scan result is 2280 bytes (wifid asks for that much): the iOS 16.5 record up to the
++ * elements, then (IO80211 __addScanResultToList) a u64 TIMESTAMP at 0x8d0, a u8 at 0x8d8, u32s at 0x8dc and 0x8e0 and
++ * flag bytes at 0x8e4..0x8e6. Without TIMESTAMP CoreWiFi keeps every network's first time seen, so after a minute every
++ * result fails auto-join's maxAge / minTimestamp filters (CWFFilteredScanResults: "All scan results are filtered
++ * out") and Wi-Fi never joins by itself. kern.sweet_wifi_ts picks the clock, while the right one is confirmed:
++ * 1 mach_continuous_time ticks, 2 mach_absolute_time ticks, 3 continuous ns, 4 absolute ns (default), 0 leave 0.
++ * (mach_continuous_time is not scaled to the 24 MHz timebase here, so 3 runs 20% slow; 4 is exact without sleep.)
++ */
++#define SCAN_RESULT_27_SIZE     2280
++#define SCAN_RESULT_27_TIMESTAMP 0x8d0
++static int sweet_wifi_ts = 4;     /* 2026-11-27 test: CoreWiFi's ages are in ns (mode 4 gave ages of 1-10 s) */
++SYSCTL_INT(_kern, OID_AUTO, sweet_wifi_ts, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_wifi_ts, 0,
++    "scan result TIMESTAMP clock: 0 none, 1 continuous ticks, 2 absolute ticks, 3 continuous ns, 4 absolute ns");
++
++static uint64_t
++scan_result_timestamp(uint32_t age_ms)
++{
++	uint64_t now, age;
++	int mode = sweet_wifi_ts;
++
++	if (mode < 1 || mode > 4) {
++		return 0;
++	}
++	now = (mode == 1 || mode == 3) ? mach_continuous_time() : mach_absolute_time();
++	nanoseconds_to_absolutetime((uint64_t)age_ms * NSEC_PER_MSEC, &age);
++	now = now > age ? now - age : 0;
++	if (mode >= 3) {
++		absolutetime_to_nanoseconds(now, &now);
++	}
++	return now;
++}
++
+ /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+ static int
+ give_network(const struct apple80211req *request, const struct redwood_sta_bss *bss)
+@@ -259,6 +295,13 @@
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	/*
++	 * 2026-11-27: a noise floor and SNR as every Apple driver gives them (noise_known 1). Without them IO80211 leaves
++	 * NOISE and SNR out and auto-join refused the home network at -49 dBm: "Below minimum RSSI threshold".
++	 */
++	result->noise_known = 1;
++	result->noise = -92;
++	result->snr = (int16_t)(bss->rssi + 92 > 0 ? bss->rssi + 92 : 0);
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -278,7 +321,21 @@
+ 			}
+ 		}
+ 	}
+-	error = give(request, result, sizeof(*result));
++	if (request->req_len >= SCAN_RESULT_27_SIZE) {
++		uint8_t *whole = kalloc_data(SCAN_RESULT_27_SIZE, Z_WAITOK | Z_ZERO);
++		uint64_t stamp = scan_result_timestamp(bss->age_ms);
++
++		if (whole == NULL) {
++			kfree_data(result, sizeof(*result));
++			return ENOMEM;
++		}
++		memcpy(whole, result, sizeof(*result));
++		memcpy(whole + SCAN_RESULT_27_TIMESTAMP, &stamp, sizeof(stamp));
++		error = give(request, whole, SCAN_RESULT_27_SIZE);
++		kfree_data(whole, SCAN_RESULT_27_SIZE);
++	} else {
++		error = give(request, result, sizeof(*result));
++	}
+ 	kfree_data(result, sizeof(*result));
+ 	return error;
+ }

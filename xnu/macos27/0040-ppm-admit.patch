@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/arm/SweetABP.cpp
++++ b/iokit/Kernel/arm/SweetABP.cpp
+@@ -1063,6 +1063,27 @@
+ 	} else if (args->structureOutput && args->structureOutputSize) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
++	/*
++	 * 2026-11-27 (Claude): ApplePPM sel 0xc is libPPM's admission check
++	 * (-[PPMClientUserClientInterface admissionCheckOfValuePPM:clientNumber:level:result:], 27.2): a 17-byte struct
++	 * in {u8 client number, 2 bytes, u32 level at byte 3, ...} and a 17-byte struct out whose u32 at byte 3 is the
++	 * result; non-zero = admitted (-[PPMClient admissionCheckWithLevel:...] calls its handler with result != 0).
++	 * The zeroed reply refused every request: wifid's WiFiBatteryManager then claimed no power resource and aborted
++	 * every auto-join ("Insufficient battery resource", reason PowerResource). Admit everything: echo the request,
++	 * so the result is the level asked for.
++	 */
++	if (fKind == 2 && selector == 0xc && args->structureInput && args->structureInputSize >= 7 &&
++	    args->structureOutput && args->structureOutputSize >= 7) {
++		uint32_t n = args->structureInputSize < args->structureOutputSize ? args->structureInputSize :
++		    args->structureOutputSize;
++		bcopy(args->structureInput, args->structureOutput, n);
++		uint32_t level;
++		bcopy((const uint8_t *)args->structureInput + 3, &level, sizeof(level));
++		if (level == 0) {
++			level = 100;
++			bcopy(&level, (uint8_t *)args->structureOutput + 3, sizeof(level));
++		}
++	}
+ 	if (abs_calls[fKind < 3 ? fKind : 2][selector < 0x20 ? selector : 0x1f]++ < 4) {
+ 		abp_log_call(fKind == 2 ? "ApplePPM" : fKind ? "AppleBasebandPCITrace" : "AppleBasebandPCIPDPManagerBase", selector,
+ 		    args, kIOReturnSuccess);
