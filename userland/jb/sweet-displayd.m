@@ -14,6 +14,12 @@
  *   sweet-displayd -1        print what iOS says once and exit (writes nothing)
  * 2026-11-26: also mirrors iOS's Low Power Mode into sysctl kern.sweet_lowpower (kernel: capped CPU clocks, no touch
  * boost, the UI at ~30 fps): powerd's notify state for com.apple.system.lowpowermode, or NSProcessInfo's flag.
+ * 2026-11-27: wake without the ~1 s at minimum brightness: iOS reports 0.0 while the screen is off and goes on
+ * reporting it for about a second after wake. SpringBoard's com.apple.springboard.hasBlankedScreen (notify state
+ * 1 = blanked) says when the screen is back; for 3 s after that, a 0.0 from iOS is taken as "not caught up yet" and
+ * the last level iOS gave before the screen went off is used. And while the screen is blanked (it is black then:
+ * on this OLED panel black pixels give no light at any brightness) the panel is kept at that level instead of the
+ * minimum, so the first frames after wake, drawn before SpringBoard says the screen is on, are not dim either.
  * MIT, as userland/.
  */
 #import <Foundation/Foundation.h>
@@ -224,6 +230,14 @@ int main(int argc, char **argv)
 		}
 		double last_r = -1, last_g = -1, last_b = -1;
 		int last_panel = -1, last_lp = -1;
+		int blank_token = -1;
+		if (notify_register_check("com.apple.springboard.hasBlankedScreen", &blank_token) != NOTIFY_STATUS_OK)
+			blank_token = -1;
+		float last_lit = 1.0f;          /* the level before the screen went off (before iOS's fade-out) */
+		float hist[20] = {0};           /* the last 2 s of levels (100 ms apart): the fade-out at lock */
+		unsigned hist_n = 0;
+		int was_blanked = 0;
+		double unblanked_at = -100;
 		for (;;) {
 			@autoreleasepool {
 				int fn = 0, fi = 0, lp = low_power(&fn, &fi);
@@ -235,6 +249,33 @@ int main(int argc, char **argv)
 				float level = BKSDisplayBrightnessGetCurrent ? BKSDisplayBrightnessGetCurrent() : 1.0f;
 				if (!(level >= 0 && level <= 1))
 					level = 1;
+				uint64_t bstate = 0;
+				int blanked = blank_token >= 0 && notify_get_state(blank_token, &bstate) == NOTIFY_STATUS_OK && bstate != 0;
+				double now = [NSDate timeIntervalSinceReferenceDate];
+				if (!was_blanked && blanked) {
+					float m = 0;
+					for (unsigned i = 0; i < 20; ++i)
+						m = fmaxf(m, hist[i]);
+					if (m > 0)
+						last_lit = m;   /* the highest level of the last 2 s: before the fade-out */
+					if (verbose)
+						fprintf(stderr, "sweet-displayd: screen off (keeping %.3f for the wake)\n", last_lit);
+				}
+				if (!blanked)
+					hist[hist_n++ % 20] = level;
+				if (was_blanked && !blanked) {
+					unblanked_at = now;
+					if (verbose)
+						fprintf(stderr, "sweet-displayd: screen on (iOS says %.3f; using %.3f until it catches up)\n",
+						    level, last_lit);
+				}
+				was_blanked = blanked;
+				if (!blanked && now - unblanked_at < 3.0)
+					level = fmaxf(level, last_lit); /* just woken: iOS still at 0 or fading in from it */
+				else if (blanked && level <= 0.0f)
+					level = last_lit;           /* blanked (black): ready for the wake at full level */
+				else if (!blanked && level > 0.0f && now - unblanked_at >= 3.0)
+					last_lit = level;
 				bool active = false;
 				float strength = 0;
 				night_shift(&active, &strength);
