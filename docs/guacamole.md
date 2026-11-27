@@ -227,6 +227,12 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   entitlements, app group containers and keychain all fail), and the main
   binary with the IPA's original entitlements (Telegram 10.2.6 crashes in
   CloudKit without icloud-services, stays black without its app group).
+  Check before copying the main binary to the phone (2026-11-27; Minecraft 1.26.60 aborted at launch with
+  securityd -34018 "Client has neither application-identifier nor keychain-access-groups entitlements" because
+  its binary had been re-signed without them):
+  `codesign -d --entitlements :- Payload/APP.app/BINARY | grep -c -E "application-identifier|keychain-access-groups"`
+  must print 2. Less means the re-sign dropped the entitlements: extract them from the original IPA's binary
+  (`codesign -d --entitlements :- ... > ents.plist`) and re-sign with `codesign -f -s - --entitlements ents.plist`.
 - Frame rate (swipes, `SWEET FB: 5s:` lines of 0151/0153/0155): 25 -> 37-44
   fps. 0149 presents on the GPU's 2D engine (CP_BLIT scale, 18 us of CPU
   instead of 21 ms), 0150 at the swap (the GPU orders the blit behind the
