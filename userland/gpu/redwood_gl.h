@@ -1,6 +1,6 @@
 /*
  * What src/eagl.c asks of the OpenGL ES library behind it besides the gl* functions: see
- * src/gl_osmesa.c, the one implementation there is.
+ * gl_osmesa.c (Mesa, off-screen) and gl_angle.c (ANGLE on Vulkan, 2026-11-27).
  */
 #ifndef REDWOOD_GL_H
 #define REDWOOD_GL_H
@@ -11,6 +11,8 @@ struct redwood_gl *redwood_gl_create(int version);              /* a context of 
 int redwood_gl_make_current(struct redwood_gl *gl);             /* ... the calling thread's (NULL: none); 0 on failure */
 void redwood_gl_destroy(struct redwood_gl *gl);
 const char *redwood_gl_library(void);                           /* for the log */
+int redwood_gl_supports_es1(void);                              /* 2026-11-27: OpenGL ES 1 contexts to be had (ANGLE) */
+void *redwood_gl_proc(const char *name);                        /* ... and a function of the library by name (OES names) */
 
 /*
  * The texture bound to GL_TEXTURE_2D made of an IOSurface's own memory: what is drawn into the

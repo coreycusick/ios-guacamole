@@ -19,6 +19,16 @@ the kernel has published RedwoodGPU.
 Changes of ours in `eagl.c`: the glwho=1 debug lines (`who_made()`, and a
 line when a surface with no pixel format changes), marked "ios-sweet".
 
+## ANGLE (2026-11-27)
+
+`gl_angle.c` puts the same EAGLContext on ANGLE (OpenGL ES 1, 2 and 3 on Vulkan, BSD) instead of OSMesa: ANGLE's Vulkan
+back end on Turnip (`libvulkan_freedreno.dylib` in NativeAdrenoMetal.bundle), so an app's OpenGL ES reaches the GPU
+without Metal or Apple's GL-on-Metal renderer. Contexts are EGL pbuffer contexts; ANGLE makes no texture of an IOSurface's
+memory, so `-presentRenderbuffer:` reads the frame back and writes it into the layer's IOSurface (`readback` drawables in
+`eagl.c`). OpenGL ES 1 contexts are made where the library has them (ANGLE does), their framebuffer calls by their OES
+names. `userland/build.sh` builds `out/angle/libsweet-gl.dylib` + `libsweet-glapp.dylib` when `ANGLE_OUT` holds
+ANGLE's `libEGL.dylib` and `libGLESv2.dylib` and `ANGLE_SRC` its checkout (for the Khronos `gl.xml` in `third_party/OpenGL-Registry`; `ANGLE_GLXML` names another).
+
 ## Origin and licence
 
 `eagl.c`, `gl_osmesa.c` and `redwood_gl.h` are taken from

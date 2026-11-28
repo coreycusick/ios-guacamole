@@ -233,6 +233,48 @@ frontend + the metal2vulkan bridge, MIT) over Turnip (`userland/turnip`, Mesa
   `codesign -d --entitlements :- Payload/APP.app/BINARY | grep -c -E "application-identifier|keychain-access-groups"`
   must print 2. Less means the re-sign dropped the entitlements: extract them from the original IPA's binary
   (`codesign -d --entitlements :- ... > ents.plist`) and re-sign with `codesign -f -s - --entitlements ents.plist`.
+  iCloud too (2026-11-27): an app that asks for a CloudKit container it is not entitled to stops on a `brk 1` in
+  CloudKit (`EXC_BREAKPOINT`, CloudKit frames under the app's `CKContainer containerWithIdentifier` or start-up code:
+  Cut the Rope Remastered, Balatro). Its entitlements need `com.apple.developer.icloud-container-identifiers`,
+  `com.apple.developer.icloud-services` (`CloudKit`) and `com.apple.developer.icloud-container-environment`
+  (`Production`). The plist `codesign` prints is one line, so count keys with `tr '<' '\n' < ents.plist | grep -c
+  icloud`, not `grep -c`. With no Apple Account CloudKit then answers "Not Authenticated", which the games handle.
+- An IPA whose binary has no entitlements at all (`codesign -d` says "no signature" / prints nothing: Balatro v1.3)
+  gets them written by hand: the bundle ID from `plutil -p Payload/APP.app/Info.plist | grep CFBundleIdentifier`,
+  the container from `strings Payload/APP.app/BINARY | grep "^iCloud\."`, and a placeholder team `0000000000`
+  (nothing on the phone checks it; CloudKit only needs the container listed):
+  `application-identifier` = `0000000000.BUNDLEID`, `com.apple.developer.team-identifier` = `0000000000`,
+  `keychain-access-groups` = [`0000000000.BUNDLEID`], `com.apple.developer.ubiquity-kvstore-identifier` =
+  `0000000000.BUNDLEID`, plus the three iCloud keys above (containers: the one in the binary and
+  `iCloud.BUNDLEID`). `plutil -lint ents.plist` must say OK. Pass the file as `ENTS=` to tools/angle-app.sh, or
+  to `codesign -f -s - --entitlements ents.plist BINARY`.
+- OpenGL ES games (2026-11-27: Angry Birds Classic, Geometry Dash World, Balatro; the original Cut the Rope family
+  is OpenGL ES too, Remastered is Unity/Metal): iOS's own OpenGL ES (Apple's GL-on-Metal renderer over our Metal
+  driver) creates contexts but games hit Metal gaps there (refused swizzled render targets; Geometry Dash reset the
+  phone). Use ANGLE instead: OpenGL ES 1.1 / 2 / 3.2 on Vulkan, straight to Turnip.
+  - On the phone: `/usr/lib/angle/libGLESv2.dylib` (+ libEGL, unused), `/usr/lib/libsweet-gl.dylib` and
+    `/usr/lib/libsweet-glapp.dylib` from `userland/out/angle/` (`userland/build.sh` builds them from ANGLE's
+    `out-ios` and `src` checkouts in `work/angle`: `ANGLE_OUT`, `ANGLE_SRC`, `ANGLE_GLXML`). ANGLE is built for iOS
+    with only its Vulkan back end, the Vulkan null display (pbuffers only), the Khronos loader skipped and Turnip
+    dlopened directly from `/System/Library/Extensions/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib`;
+    arm64 + PAC-lowered arm64e. Test with `DYLD_INSERT_LIBRARIES=/usr/lib/libsweet-glapp.dylib
+    /var/local/bin/glprobe -n` (GL_RENDERER "ANGLE (Qualcomm, Vulkan ... Turnip Adreno (TM) 640 ...)", read back
+    255 128 64 255).
+  - Per app: `tools/angle-app.sh /Applications/NAME.app` adds `/usr/lib/libsweet-glapp.dylib` to the executable
+    (tools/insert-dylib.py), re-signs it with its own entitlements (or `ENTS=file`), installs it as `.new` and keeps
+    the original as `EXECUTABLE.pre-angle`; `--undo` puts the original back. Run again, it starts from the original.
+  - A process with a Metal device cannot also have ANGLE's (Turnip's darwin back end: "BO init
+    (VK_ERROR_OUT_OF_DEVICE_MEMORY)", no Vulkan display). GL games do not open Metal; `glprobe` does unless `-n`.
+  - Frames are read back (glReadPixels) into the layer's IOSurface at each present: correct, not zero-copy yet.
+  - Logs: the shim's `redwood-gl` lines (and `SK[...]` below) go to `/var/local/gl.log` when it exists:
+    `rm -f /var/local/gl.log; touch /var/local/gl.log; chmod 666 /var/local/gl.log`, run the app, read it.
+- App Store receipt sheet (2026-11-27): an app that refreshes its receipt at launch (Balatro: "[IAP] No receipt
+  found, refreshing...", `SKReceiptRefreshRequest`) gets iOS's Apple Account sign-in sheet with no account on the
+  phone; Balatro's SDL keyboard observer crashed when the sheet's keyboard came up, and ran when the sheet was
+  closed quickly. `/usr/lib/libsweet-skquiet.dylib` (userland/jb/skquiet.m) answers that request at once as
+  cancelled (`SKErrorPaymentCancelled`, what Cancel gives), with no sheet; nothing else in StoreKit changes and no
+  receipt is made up. Load it with ANGLE:
+  `ENTS=ents.plist EXTRA_DYLIBS=/usr/lib/libsweet-skquiet.dylib tools/angle-app.sh /Applications/Balatro.app`.
 - Frame rate (swipes, `SWEET FB: 5s:` lines of 0151/0153/0155): 25 -> 37-44
   fps. 0149 presents on the GPU's 2D engine (CP_BLIT scale, 18 us of CPU
   instead of 21 ms), 0150 at the swap (the GPU orders the blit behind the

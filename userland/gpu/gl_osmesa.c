@@ -113,3 +113,16 @@ redwood_gl_surface_texture(struct redwood_gl *gl, uint32_t surface)
 	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
 	return glGetError() == 0;
 }
+
+/* 2026-11-27 (redwood_gl.h): OSMesa's OpenGL ES profile has no OpenGL ES 1 */
+int
+redwood_gl_supports_es1(void)
+{
+	return 0;
+}
+
+void *
+redwood_gl_proc(const char *name)
+{
+	return (void *)OSMesaGetProcAddress(name);
+}

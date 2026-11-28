@@ -3518,12 +3518,14 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	(void)properties;
 	for (place = 0; place < sizeof(contexts) / sizeof(contexts[0]) && contexts[place] != NULL; place++) {
 	}
-	if (api < 2 || api > 3 || place == sizeof(contexts) / sizeof(contexts[0]) || (e = calloc(1, sizeof(*e))) == NULL) {
+	/* 2026-11-27: OpenGL ES 1 where the library has it (ANGLE: Angry Birds Classic, cocos2d 1.x games) */
+	if (api < 1 || api > 3 || (api == 1 && !redwood_gl_supports_es1()) || place == sizeof(contexts) / sizeof(contexts[0]) ||
+	    (e = calloc(1, sizeof(*e))) == NULL) {
 		say("redwood-gl: no context of API %lu\n", api);
 		return nil;
 	}
 	/* 0190: an app's OpenGL ES 2 context is made a 3 underneath (the present uses glBlitFramebuffer); it is told 2 */
-	if ((e->gl = redwood_gl_create(api < 3 ? 3 : (int)api)) == NULL || !redwood_gl_make_current(e->gl)) {
+	if ((e->gl = redwood_gl_create(api == 1 ? 1 : 3)) == NULL || !redwood_gl_make_current(e->gl)) {
 		say("redwood-gl: %s gives no OpenGL ES %lu context\n", redwood_gl_library(), api);
 		free(e);
 		return nil;
@@ -3829,6 +3831,8 @@ struct app_drawable {
 	GLuint texture[APP_SURFACES];
 	unsigned next;
 	unsigned presents;
+	bool readback;                  /* 2026-11-27: no texture of a surface's memory (ANGLE): frames are read back into it */
+	uint8_t *pixels;                /* ... through this (width * height * 4) */
 };
 static struct app_drawable app_drawables[16];
 static GLuint app_read_fb, app_draw_fb;                 /* framebuffers of ours for the copy */
@@ -3852,6 +3856,7 @@ app_drawable_free(struct app_drawable *d)
 	if (d->layer != nil) {
 		((void (*)(id, SEL))objc_msgSend)(d->layer, sel_registerName("release"));
 	}
+	free(d->pixels);
 	memset(d, 0, sizeof(*d));
 }
 
@@ -3875,6 +3880,58 @@ app_surface_new(GLsizei width, GLsizei height)
 		CFRelease(numbers[i]);
 	}
 	return surface;
+}
+
+/*
+ * 2026-11-27: an OpenGL ES 1 context (ANGLE) has framebuffers only as OES_framebuffer_object: the same calls by their
+ * OES names, which ANGLE gives through eglGetProcAddress.
+ */
+static void
+app_gen_framebuffers(struct eagl *e, GLsizei n, GLuint *names)
+{
+	static void (*oes)(GLsizei, GLuint *);
+	if (e->api != 1) {
+		glGenFramebuffers(n, names);
+	} else if (oes != NULL || (oes = (void (*)(GLsizei, GLuint *))redwood_gl_proc("glGenFramebuffersOES")) != NULL) {
+		oes(n, names);
+	}
+}
+static void
+app_bind_framebuffer(struct eagl *e, GLenum target, GLuint name)
+{
+	static void (*oes)(GLenum, GLuint);
+	if (e->api != 1) {
+		glBindFramebuffer(target, name);
+	} else if (oes != NULL || (oes = (void (*)(GLenum, GLuint))redwood_gl_proc("glBindFramebufferOES")) != NULL) {
+		oes(0x8D40 /* GL_FRAMEBUFFER_OES: OpenGL ES 1 has no read / draw targets */, name);
+	}
+}
+static void
+app_framebuffer_renderbuffer(struct eagl *e, GLenum target, GLuint renderbuffer)
+{
+	static void (*oes)(GLenum, GLenum, GLenum, GLuint);
+	if (e->api != 1) {
+		glFramebufferRenderbuffer(target, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+	} else if (oes != NULL || (oes = (void (*)(GLenum, GLenum, GLenum, GLuint))redwood_gl_proc("glFramebufferRenderbufferOES")) != NULL) {
+		oes(0x8D40, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer);
+	}
+}
+static void
+app_renderbuffer_storage(struct eagl *e, GLsizei width, GLsizei height)
+{
+	static void (*oes)(GLenum, GLenum, GLsizei, GLsizei);
+	if (e->api != 1) {
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+	} else if (oes != NULL || (oes = (void (*)(GLenum, GLenum, GLsizei, GLsizei))redwood_gl_proc("glRenderbufferStorageOES")) != NULL) {
+		oes(GL_RENDERBUFFER, GL_RGBA8, width, height);
+	}
+}
+static GLint
+app_framebuffer_binding(struct eagl *e, GLenum which)
+{
+	GLint name = 0;
+	glGetIntegerv(e->api != 1 ? which : 0x8CA6 /* GL_FRAMEBUFFER_BINDING_OES */, &name);
+	return name;
 }
 
 static struct app_drawable *
@@ -3925,7 +3982,7 @@ my_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
 			return NO;
 		}
 	}
-	glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+	app_renderbuffer_storage(e, width, height);
 	d->e = e;
 	d->renderbuffer = (GLuint)renderbuffer;
 	d->width = width;
@@ -3936,16 +3993,30 @@ my_renderbufferStorage(id self, SEL selector, unsigned long target, id drawable)
 		d->surface[i] = app_surface_new(width, height);
 		glGenTextures(1, &d->texture[i]);
 		glBindTexture(GL_TEXTURE_2D, d->texture[i]);
-		if (d->surface[i] == NULL || !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]))) {
-			say("redwood-gl: -renderbufferStorage: surface %u of %dx%d cannot be a texture of its own memory\n", i,
-			    width, height);
+		if (d->surface[i] != NULL && !d->readback && redwood_gl_surface_texture(e->gl, IOSurfaceGetID(d->surface[i]))) {
+			continue;
+		}
+		/*
+		 * 2026-11-27: a library that makes no texture of a surface's memory (ANGLE's Vulkan back end): the present
+		 * reads the frame back into the surface instead (slower, a copy by the processor; same picture).
+		 */
+		if (d->surface[i] == NULL || (i != 0 && !d->readback)) {
+			say("redwood-gl: -renderbufferStorage: surface %u of %dx%d: none to be had\n", i, width, height);
 			glBindTexture(GL_TEXTURE_2D, (GLuint)bound_texture);
 			app_drawable_free(d);
 			return NO;
 		}
+		d->readback = true;
+		glDeleteTextures(1, &d->texture[i]);
+		d->texture[i] = 0;
 	}
 	glBindTexture(GL_TEXTURE_2D, (GLuint)bound_texture);
-	say("redwood-gl: an app's drawable: renderbuffer %d, %dx%d pixels (scale %.1f), %d surfaces %u %u %u\n", renderbuffer,
+	if (d->readback && (d->pixels = malloc((size_t)width * height * 4)) == NULL) {
+		app_drawable_free(d);
+		return NO;
+	}
+	say("redwood-gl: an app's drawable (%s): renderbuffer %d, %dx%d pixels (scale %.1f), %d surfaces %u %u %u\n",
+	    d->readback ? "read back" : "drawn in place", renderbuffer,
 	    width, height, scale, APP_SURFACES, IOSurfaceGetID(d->surface[0]), IOSurfaceGetID(d->surface[1]),
 	    IOSurfaceGetID(d->surface[2]));
 	return YES;
@@ -3974,10 +4045,59 @@ my_presentRenderbuffer(id self, SEL selector, unsigned long target)
 	}
 	if (app_fb_owner != e) {                /* framebuffers belong to a context */
 		app_fb_owner = e;
-		glGenFramebuffers(1, &app_read_fb);
-		glGenFramebuffers(1, &app_draw_fb);
+		app_gen_framebuffers(e, 1, &app_read_fb);
+		app_gen_framebuffers(e, 1, &app_draw_fb);
 	}
 	unsigned i = d->next;
+	if (d->readback) {
+		/*
+		 * 2026-11-27 (ANGLE): read the renderbuffer back and write it into the surface upside down (OpenGL's rows go
+		 * up, a surface's down), RGBA to the surface's BGRA.
+		 */
+		GLint bound = app_framebuffer_binding(e, GL_READ_FRAMEBUFFER_BINDING);
+		scissor = glIsEnabled(GL_SCISSOR_TEST);
+		app_bind_framebuffer(e, GL_READ_FRAMEBUFFER, app_read_fb);
+		app_framebuffer_renderbuffer(e, GL_READ_FRAMEBUFFER, d->renderbuffer);
+		/* the app's own pack state is left as it was: alignment, and (OpenGL ES 3) row length and a bound pack buffer */
+		GLint alignment = 4, row_length = 0, pack_buffer = 0;
+		glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+		glPixelStorei(GL_PACK_ALIGNMENT, 4);
+		if (e->api != 1) {
+			glGetIntegerv(0x0D02 /* GL_PACK_ROW_LENGTH */, &row_length);
+			glGetIntegerv(0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack_buffer);
+			glPixelStorei(0x0D02, 0);
+			glBindBuffer(0x88EB /* GL_PIXEL_PACK_BUFFER */, 0);
+		}
+		glReadPixels(0, 0, d->width, d->height, GL_RGBA, GL_UNSIGNED_BYTE, d->pixels);
+		glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+		if (e->api != 1) {
+			glPixelStorei(0x0D02, row_length);
+			glBindBuffer(0x88EB, (GLuint)pack_buffer);
+		}
+		app_bind_framebuffer(e, GL_READ_FRAMEBUFFER, (GLuint)bound);
+		if (d->presents == 0) {
+			say("redwood-gl: first present of renderbuffer %d (read back): glGetError %#x\n", d->renderbuffer, glGetError());
+		}
+		if (IOSurfaceLock(d->surface[i], 0, NULL) == 0) {
+			uint8_t *base = IOSurfaceGetBaseAddress(d->surface[i]);
+			const size_t row = IOSurfaceGetBytesPerRow(d->surface[i]);
+			for (GLsizei y = 0; y < d->height; y++) {
+				const uint8_t *from = d->pixels + (size_t)(d->height - 1 - y) * d->width * 4;
+				uint8_t *to = base + (size_t)y * row;
+				for (GLsizei x = 0; x < d->width; x++, from += 4, to += 4) {
+					to[0] = from[2];
+					to[1] = from[1];
+					to[2] = from[0];
+					to[3] = from[3];
+				}
+			}
+			IOSurfaceUnlock(d->surface[i], 0, NULL);
+		}
+		(void)scissor;
+		(void)read_fb;
+		(void)draw_fb;
+		goto show;
+	}
 	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fb);
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
 	scissor = glIsEnabled(GL_SCISSOR_TEST);
@@ -4005,6 +4125,7 @@ my_presentRenderbuffer(id self, SEL selector, unsigned long target)
 	if (IOSurfaceLock(d->surface[i], 0, NULL) == 0) {
 		IOSurfaceUnlock(d->surface[i], 0, NULL);
 	}
+show:;
 	Class transaction = objc_getClass("CATransaction");
 	((void (*)(id, SEL))objc_msgSend)((id)transaction, sel_registerName("begin"));
 	((void (*)(id, SEL, BOOL))objc_msgSend)((id)transaction, sel_registerName("setDisableActions:"), YES);

@@ -59,6 +59,10 @@ build sweet-displayd jb/sweet-displayd.m -fobjc-arc -framework Foundation
 codesign -f -s - --entitlements jb/sweet-displayd-ents.plist out/sweet-displayd
 # why MPS refuses the Metal device (photo / Pride wallpapers crash in MPSAutoCache): /var/local/bin/mpsprobe
 build mpsprobe jb/mpsprobe.m -fobjc-arc -framework Foundation -framework Metal
+# why OpenGL ES apps fail (Balatro, Geometry Dash, Angry Birds): EAGLContext / GLEngine / AppleMetalGLRenderer, step by step
+build glprobe jb/glprobe.m -fobjc-arc -framework Foundation -framework Metal -framework OpenGLES -framework IOKit -Wno-deprecated-declarations
+# an app's App Store receipt refresh answered as cancelled, without iOS's Apple Account sheet (Balatro): /usr/lib/libsweet-skquiet.dylib
+build libsweet-skquiet.dylib jb/skquiet.m -fobjc-arc -dynamiclib -install_name /usr/lib/libsweet-skquiet.dylib -framework Foundation -Wl,-not_for_dyld_shared_cache
 # why +[IOSurface bs_IOSurfaceWithWidth:height:options:] returns nil in PosterBoard (black wallpaper): /var/local/bin/surfprobe
 build surfprobe jb/surfprobe.m -fobjc-arc -framework Foundation -framework IOSurface -framework IOKit
 # Bluetooth step 1, read-only: WCN3990 UART (QUP wrapper 2 SE3) clocks, pins and engine: /var/local/bin/btprobe
@@ -140,4 +144,35 @@ if [ -f $MESA/out/libOSMesa.8.dylib ]; then
 		-framework OpenGLES -framework OpenAL -Wl,-U,_sweet_gl_current_table -Wno-deprecated-declarations
 else
 	echo "skipped osmesa-triangle: run userland/mesa/mk-mesa.sh"
+fi
+# 2026-11-27: OpenGL ES for apps on ANGLE (OpenGL ES 1/2/3 on Vulkan, straight to Turnip; no Metal, no Apple renderer).
+# ANGLE_OUT: libEGL.dylib + libGLESv2.dylib as Codex builds them (work/angle/out-ios); ANGLE_SRC: ANGLE's checkout (the
+# Khronos gl.xml in its third_party/OpenGL-Registry gives the prototypes; ANGLE_GLXML to name another). Out: out/angle/libsweet-gl.dylib + libsweet-glapp.dylib (same install names as the
+# Mesa ones: install one pair or the other) and out/angle/libEGL.dylib + libGLESv2.dylib, renamed /usr/lib/angle/....
+ANGLE_OUT=${ANGLE_OUT:-../../angle/out-ios}
+ANGLE_SRC=${ANGLE_SRC:-../../angle}
+# the Khronos registry ANGLE carries (third_party/OpenGL-Registry), or ANGLE_GLXML
+ANGLE_GLXML=${ANGLE_GLXML:-$(ls "$ANGLE_SRC"/src/third_party/OpenGL-Registry/src/xml/gl.xml "$ANGLE_SRC"/third_party/OpenGL-Registry/src/xml/gl.xml "$ANGLE_SRC"/angle/third_party/OpenGL-Registry/src/xml/gl.xml "$ANGLE_SRC"/scripts/gl.xml 2>/dev/null | head -1)}
+if [ -f "$ANGLE_OUT/libGLESv2.dylib" ] && [ -f "$ANGLE_OUT/libEGL.dylib" ] && [ -f "$ANGLE_GLXML" ]; then
+	mkdir -p out/angle
+	for lib in libEGL libGLESv2; do
+		cp "$ANGLE_OUT/$lib.dylib" out/angle/$lib.dylib
+		install_name_tool -id /usr/lib/angle/$lib.dylib out/angle/$lib.dylib
+	done
+	install_name_tool -change "$(otool -L out/angle/libEGL.dylib | awk '/libGLESv2/ {print $1; exit}')" \
+		/usr/lib/angle/libGLESv2.dylib out/angle/libEGL.dylib 2>/dev/null || true
+	codesign -f -s - out/angle/libEGL.dylib out/angle/libGLESv2.dylib
+	[ -f out/opengles-exports.txt ] || grep -o '_gl[A-Za-z0-9_]*' "$SDK/System/Library/Frameworks/OpenGLES.framework/OpenGLES.tbd" | \
+		sed 's/^_//' | sort -u > out/opengles-exports.txt
+	nm -gU out/angle/libGLESv2.dylib | awk '$3 ~ /^_gl/ {print substr($3, 2)}' | sort -u > out/angle/exported-gl.txt
+	python3 gpu/mkeagl.py gpu/eagl_slots.txt "$ANGLE_GLXML" out/angle/exported-gl.txt gpu/eagl.c \
+		out/opengles-exports.txt > out/angle/eagl_gen.h
+	build angle/libsweet-gl.dylib gpu/eagl.c gpu/gl_angle.c -dynamiclib -install_name /usr/lib/libsweet-gl.dylib \
+		-Iout/angle -Igpu out/angle/libGLESv2.dylib -Wl,-not_for_dyld_shared_cache \
+		-Wno-unused-but-set-variable -framework OpenGLES -framework IOKit -framework IOSurface -framework CoreFoundation -lobjc
+	build angle/libsweet-glapp.dylib gpu/glapp.c gpu/nullal.c -dynamiclib -install_name /usr/lib/libsweet-glapp.dylib \
+		-Iout/angle out/angle/libsweet-gl.dylib -Wl,-not_for_dyld_shared_cache -Wno-unused-function -Wno-unused-parameter \
+		-framework OpenGLES -framework OpenAL -Wl,-U,_sweet_gl_current_table -Wno-deprecated-declarations
+else
+	echo "skipped ANGLE OpenGL ES: no $ANGLE_OUT/libGLESv2.dylib + libEGL.dylib, or no gl.xml (set ANGLE_GLXML)"
 fi
